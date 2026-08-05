@@ -7,6 +7,7 @@ description = "Rust-native HackRF RX driver built on nusb."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/hackrf-nusb"
+repository = "https://github.com/bastibl/hackrf-nusb"
 keywords = ["hackrf", "sdr", "usb", "nusb", "webusb"]
 categories = ["hardware-support", "api-bindings", "asynchronous"]
 
