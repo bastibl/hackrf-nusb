@@ -2,6 +2,25 @@
 name = "hackrf-nusb"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Rust-native HackRF RX driver built on nusb."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/hackrf-nusb"
+keywords = ["hackrf", "sdr", "usb", "nusb", "webusb"]
+categories = ["hardware-support", "api-bindings", "asynchronous"]
+
+[features]
+default = []
+tokio = ["nusb/tokio"]
+smol = ["nusb/smol"]
 
 [dependencies]
+nusb = "0.2.7"
+num-complex = "0.4"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+futures-lite = "2"
