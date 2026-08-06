@@ -1,4 +1,4 @@
-//! Validated high-level HackRF receiver configuration.
+//! Validated high-level HackRF transceiver configuration.
 
 use crate::errors::{Error, Result};
 
@@ -6,14 +6,16 @@ const DEFAULT_FREQUENCY_HZ: u64 = 900_000_000;
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 10_000_000;
 const DEFAULT_LNA_GAIN_DB: u8 = 8;
 const DEFAULT_VGA_GAIN_DB: u8 = 20;
+const DEFAULT_TX_VGA_GAIN_DB: u8 = 0;
 
-/// Validated HackRF RX configuration.
+/// Validated HackRF transceiver configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     frequency_hz: u64,
     sample_rate_hz: u32,
     lna_gain_db: u8,
     vga_gain_db: u8,
+    tx_vga_gain_db: u8,
     amp_enabled: bool,
     bias_tee_enabled: bool,
 }
@@ -25,6 +27,7 @@ impl Default for Config {
             sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
             lna_gain_db: DEFAULT_LNA_GAIN_DB,
             vga_gain_db: DEFAULT_VGA_GAIN_DB,
+            tx_vga_gain_db: DEFAULT_TX_VGA_GAIN_DB,
             amp_enabled: false,
             bias_tee_enabled: false,
         }
@@ -32,7 +35,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Start building a validated receiver configuration.
+    /// Start building a validated transceiver configuration.
     pub fn builder() -> ConfigBuilder {
         ConfigBuilder::default()
     }
@@ -55,6 +58,11 @@ impl Config {
     /// MAX2837 baseband/VGA gain in dB.
     pub const fn vga_gain_db(&self) -> u8 {
         self.vga_gain_db
+    }
+
+    /// MAX2837 transmit VGA gain in dB.
+    pub const fn tx_vga_gain_db(&self) -> u8 {
+        self.tx_vga_gain_db
     }
 
     /// Whether the RF amplifier is enabled.
@@ -81,6 +89,10 @@ impl Config {
 
     pub(crate) fn set_vga_gain_db_internal(&mut self, value: u8) {
         self.vga_gain_db = value;
+    }
+
+    pub(crate) fn set_tx_vga_gain_db_internal(&mut self, value: u8) {
+        self.tx_vga_gain_db = value;
     }
 
     pub(crate) fn set_amp_enabled_internal(&mut self, value: bool) {
@@ -123,6 +135,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set TX VGA gain in dB.
+    pub fn tx_vga_gain_db(mut self, value: u8) -> Self {
+        self.config.tx_vga_gain_db = value;
+        self
+    }
+
     /// Enable or disable the RF amplifier.
     pub fn amp_enable(mut self, enabled: bool) -> Self {
         self.config.amp_enabled = enabled;
@@ -147,6 +165,7 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
     validate_sample_rate(config.sample_rate_hz)?;
     validate_lna_gain(config.lna_gain_db)?;
     validate_vga_gain(config.vga_gain_db)?;
+    validate_tx_vga_gain(config.tx_vga_gain_db)?;
     Ok(())
 }
 
@@ -190,6 +209,16 @@ pub(crate) fn validate_vga_gain(value: u8) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_tx_vga_gain(value: u8) -> Result<()> {
+    if value > 47 {
+        return Err(Error::invalid_config(
+            "tx_vga_gain_db",
+            "must be between 0 dB and 47 dB inclusive",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +230,7 @@ mod tests {
         assert_eq!(config.sample_rate_hz(), 10_000_000);
         assert_eq!(config.lna_gain_db(), 8);
         assert_eq!(config.vga_gain_db(), 20);
+        assert_eq!(config.tx_vga_gain_db(), 0);
         assert!(!config.amp_enabled());
         assert!(!config.bias_tee_enabled());
     }
@@ -223,6 +253,7 @@ mod tests {
         );
         assert!(Config::builder().lna_gain_db(7).build().is_err());
         assert!(Config::builder().vga_gain_db(3).build().is_err());
+        assert!(Config::builder().tx_vga_gain_db(48).build().is_err());
         assert!(
             Config::builder()
                 .lna_gain_db(40)

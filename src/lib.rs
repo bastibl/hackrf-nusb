@@ -1,9 +1,11 @@
-//! Rust-native RX-only HackRF driver built on [`nusb`].
+//! Rust-native half-duplex HackRF driver built on [`nusb`].
 //!
-//! One-shot operations and receive-stream operations implement [`MaybeFuture`]:
-//! await them in asynchronous code, or call [`MaybeFuture::wait`] on native
-//! targets. The receive stream owns its USB endpoint and transfer queue, so the
-//! steady-state read path does not lock shared device state.
+//! One-shot and streaming operations implement [`MaybeFuture`]: await them in
+//! asynchronous code, or call [`MaybeFuture::wait`] on native targets. Do not
+//! mix execution styles across RX and TX streams. HackRF direction changes are
+//! explicit: start one stream, use it, stop it, then start the other. The
+//! receive stream owns its USB endpoint and transfer queue, so the steady-state
+//! read path does not lock shared device state.
 //!
 //! # Synchronous example
 //!
@@ -42,6 +44,7 @@ mod discovery;
 mod errors;
 mod high_level;
 mod maybe_future;
+mod radio;
 mod streaming;
 mod types;
 mod usb;
@@ -50,8 +53,9 @@ pub use config::{Config, ConfigBuilder};
 pub use constants::MAX_COMPLEX_SAMPLES_PER_TRANSFER;
 pub use discovery::DeviceDescriptor;
 pub use errors::{Error, ErrorKind, Result};
-pub use high_level::{Device, DeviceBuilder, RxStream};
+pub use high_level::{Device, DeviceBuilder, RxStream, TxStream};
 pub use num_complex::Complex32;
 pub use nusb::MaybeFuture;
+pub use radio::TxStreamingStats;
 pub use streaming::StreamingStats;
 pub use types::{BoardId, DeviceInfo};

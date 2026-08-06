@@ -6,7 +6,7 @@ use core::fmt;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// A receiver configuration value failed validation.
+    /// A transceiver configuration value failed validation.
     InvalidConfig {
         /// Name of the invalid field.
         field: &'static str,
@@ -21,7 +21,7 @@ pub enum Error {
     Busy,
     /// The requested operation is unsupported.
     Unsupported,
-    /// The receive stream is stopped or unusable.
+    /// A stream is stopped or unusable.
     StreamClosed {
         /// Reason the stream is unavailable.
         reason: &'static str,

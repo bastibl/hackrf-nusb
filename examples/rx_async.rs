@@ -60,8 +60,8 @@ async fn run(args: Vec<String>) -> hackrf_nusb::Result<()> {
 
     if run_rx {
         let mut rx = device.rx_stream()?;
-        rx.start().await?;
         let mut samples = [Complex32::default(); 4096];
+        rx.start().await?;
         let count = rx.read(&mut samples, None).await?;
         let stats = rx.stop().await?;
         drop(rx);

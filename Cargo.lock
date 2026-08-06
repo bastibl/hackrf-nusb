@@ -177,6 +177,7 @@ dependencies = [
 name = "hackrf-nusb"
 version = "0.2.0"
 dependencies = [
+ "atomic-waker",
  "futures-lite",
  "num-complex",
  "nusb",

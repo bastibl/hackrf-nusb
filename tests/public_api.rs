@@ -1,7 +1,6 @@
-use hackrf_nusb::{
-    BoardId, Config, Device, DeviceBuilder, ErrorKind, MAX_COMPLEX_SAMPLES_PER_TRANSFER,
-    StreamingStats,
-};
+use hackrf_nusb::{BoardId, Config, ErrorKind, MAX_COMPLEX_SAMPLES_PER_TRANSFER};
+#[cfg(not(target_arch = "wasm32"))]
+use hackrf_nusb::{Device, DeviceBuilder, StreamingStats, TxStream, TxStreamingStats};
 
 #[test]
 fn documented_defaults_and_boundaries_are_public() {
@@ -10,6 +9,7 @@ fn documented_defaults_and_boundaries_are_public() {
     assert_eq!(config.sample_rate_hz(), 10_000_000);
     assert_eq!(config.lna_gain_db(), 8);
     assert_eq!(config.vga_gain_db(), 20);
+    assert_eq!(config.tx_vga_gain_db(), 0);
     assert!(!config.amp_enabled());
     assert!(!config.bias_tee_enabled());
 
@@ -28,6 +28,7 @@ fn documented_defaults_and_boundaries_are_public() {
             .sample_rate_hz(20_000_000)
             .lna_gain_db(40)
             .vga_gain_db(62)
+            .tx_vga_gain_db(47)
             .build()
             .is_ok()
     );
@@ -39,6 +40,7 @@ fn invalid_config_has_a_stable_category() {
     assert_eq!(error.kind(), ErrorKind::InvalidConfig);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn main_public_types_remain_send_on_native() {
     fn assert_send<T: Send>() {}
@@ -47,6 +49,8 @@ fn main_public_types_remain_send_on_native() {
     assert_send::<Device>();
     assert_send::<DeviceBuilder>();
     assert_send::<StreamingStats>();
+    assert_send::<TxStream>();
+    assert_send::<TxStreamingStats>();
 }
 
 #[test]

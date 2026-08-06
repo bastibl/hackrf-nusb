@@ -10,7 +10,7 @@ use crate::Complex32;
 use crate::constants::{TRANSFER_COUNT, TRANSFER_SIZE};
 use crate::errors::{Error, Result};
 
-/// Counters collected during a receive-stream lifetime.
+/// Counters collected during one RX `start`/`stop` period.
 ///
 /// HackRF sample transfers have no sequence number, so these counters cannot
 /// detect samples lost inside the device before a USB completion reaches the
@@ -21,24 +21,8 @@ pub struct StreamingStats {
     pub buffers_received: u64,
     /// Successful completions accepted for sample conversion.
     pub buffers_processed: u64,
-    /// Completions discarded because of errors or controlled restart.
+    /// Completions discarded because of errors.
     pub buffers_dropped: u64,
-    /// Old submissions drained before exposing samples after a restart.
-    pub buffers_discarded_on_restart: u64,
-}
-
-impl StreamingStats {
-    pub(crate) fn accumulate(&mut self, other: Self) {
-        self.buffers_received += other.buffers_received;
-        self.buffers_processed += other.buffers_processed;
-        self.buffers_dropped += other.buffers_dropped;
-        self.buffers_discarded_on_restart += other.buffers_discarded_on_restart;
-    }
-
-    pub(crate) fn combined(mut self, other: Self) -> Self {
-        self.accumulate(other);
-        self
-    }
 }
 
 #[derive(Debug)]
@@ -97,7 +81,6 @@ pub(crate) struct DirectRxStream<B: BulkInBackend> {
     current: Option<B::Buffer>,
     current_len: usize,
     current_offset: usize,
-    pending_i: Option<i8>,
     stats: StreamingStats,
     closed: bool,
 }
@@ -108,8 +91,6 @@ pub(crate) struct AsyncDirectRxStream<B: AsyncBulkInBackend> {
     current: Option<B::Buffer>,
     current_len: usize,
     current_offset: usize,
-    pending_i: Option<i8>,
-    discard_remaining: usize,
     stats: StreamingStats,
     closed: bool,
 }
@@ -167,10 +148,17 @@ impl<B: BulkInBackend> DirectRxStream<B> {
             self.current = None;
             self.current_len = 0;
             self.current_offset = 0;
-            self.pending_i = None;
             self.closed = true;
         }
         self.stats
+    }
+
+    pub(crate) fn stats(&self) -> StreamingStats {
+        self.stats
+    }
+
+    pub(crate) fn reset_stats(&mut self) {
+        self.stats = StreamingStats::default();
     }
 
     fn accept_completion(&mut self, completion: BulkInCompletion<B::Buffer>) -> Result<()> {
@@ -198,7 +186,6 @@ impl<B: BulkInBackend> DirectRxStream<B> {
             &buffer[self.current_offset..self.current_len],
             out,
             &mut self.current_offset,
-            &mut self.pending_i,
         ))
     }
 
@@ -273,18 +260,6 @@ impl<B: AsyncBulkInBackend> AsyncDirectRxStream<B> {
                 }
             };
 
-            if self.discard_remaining != 0 {
-                self.discard_remaining -= 1;
-                self.stats.buffers_received += 1;
-                self.stats.buffers_dropped += 1;
-                self.stats.buffers_discarded_on_restart += 1;
-                let buffer = completion.buffer;
-                self.bulk_in_mut()
-                    .expect("bulk endpoint exists")
-                    .submit(buffer);
-                continue;
-            }
-
             self.stats.buffers_received += 1;
             let (buffer, actual_len) = match checked_completion(completion) {
                 Ok(value) => value,
@@ -312,30 +287,6 @@ impl<B: AsyncBulkInBackend> AsyncDirectRxStream<B> {
         }
     }
 
-    pub(crate) fn pause(&mut self) -> Result<()> {
-        if self.closed {
-            return Ok(());
-        }
-        if let Some(buffer) = self.current.take() {
-            self.current_len = 0;
-            self.current_offset = 0;
-            self.bulk_in_mut()?.submit(buffer);
-        }
-        self.pending_i = None;
-        let pending = self.bulk_in_mut()?.pending();
-        self.discard_remaining = pending;
-        self.bulk_in_mut()?.cancel_all();
-        Ok(())
-    }
-
-    pub(crate) fn stats(&self) -> StreamingStats {
-        self.stats
-    }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.closed
-    }
-
     pub(crate) fn close(&mut self) -> StreamingStats {
         if !self.closed {
             if let Some(bulk_in) = self.bulk_in.as_mut() {
@@ -345,10 +296,17 @@ impl<B: AsyncBulkInBackend> AsyncDirectRxStream<B> {
             self.current = None;
             self.current_len = 0;
             self.current_offset = 0;
-            self.pending_i = None;
             self.closed = true;
         }
         self.stats
+    }
+
+    pub(crate) fn stats(&self) -> StreamingStats {
+        self.stats
+    }
+
+    pub(crate) fn reset_stats(&mut self) {
+        self.stats = StreamingStats::default();
     }
 
     fn drain_current(&mut self, out: &mut [Complex32]) -> Result<usize> {
@@ -359,7 +317,6 @@ impl<B: AsyncBulkInBackend> AsyncDirectRxStream<B> {
             &buffer[self.current_offset..self.current_len],
             out,
             &mut self.current_offset,
-            &mut self.pending_i,
         ))
     }
 
@@ -398,7 +355,6 @@ impl<B: BulkInBackend> PreparedBulkIn<B, B::Buffer> {
             current: None,
             current_len: 0,
             current_offset: 0,
-            pending_i: None,
             stats: StreamingStats::default(),
             closed: false,
         })
@@ -416,8 +372,6 @@ impl<B: AsyncBulkInBackend> PreparedBulkIn<B, B::Buffer> {
             current: None,
             current_len: 0,
             current_offset: 0,
-            pending_i: None,
-            discard_remaining: 0,
             stats: StreamingStats::default(),
             closed: false,
         })
@@ -434,43 +388,24 @@ fn checked_completion<B: Deref<Target = [u8]>>(
             "completion length exceeds the submitted buffer",
         ));
     }
+    if !completion.actual_len.is_multiple_of(2) {
+        return Err(Error::protocol(
+            "receive HackRF USB transfer",
+            "completion length is not a whole number of IQ samples",
+        ));
+    }
     Ok((completion.buffer, completion.actual_len))
 }
 
-fn convert_cs8(
-    bytes: &[u8],
-    out: &mut [Complex32],
-    absolute_offset: &mut usize,
-    pending_i: &mut Option<i8>,
-) -> usize {
-    let mut input = 0;
-    let mut written = 0;
-
-    if let Some(i) = pending_i.take() {
-        if let Some(&q) = bytes.first() {
-            out[0] = Complex32::new(i as f32 / 128.0, (q as i8) as f32 / 128.0);
-            input = 1;
-            written = 1;
-        } else {
-            *pending_i = Some(i);
-            return 0;
-        }
+fn convert_cs8(bytes: &[u8], out: &mut [Complex32], absolute_offset: &mut usize) -> usize {
+    debug_assert!(bytes.len().is_multiple_of(2));
+    let samples = out.len().min(bytes.len() / 2);
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for (output, [i, q]) in out.iter_mut().zip(pairs).take(samples) {
+        *output = Complex32::new(*i as i8 as f32 / 128.0, *q as i8 as f32 / 128.0);
     }
-
-    while written < out.len() && input + 1 < bytes.len() {
-        let i = bytes[input] as i8;
-        let q = bytes[input + 1] as i8;
-        out[written] = Complex32::new(i as f32 / 128.0, q as f32 / 128.0);
-        input += 2;
-        written += 1;
-    }
-
-    if input < bytes.len() && written < out.len() {
-        *pending_i = Some(bytes[input] as i8);
-        input += 1;
-    }
-    *absolute_offset += input;
-    written
+    *absolute_offset += samples * 2;
+    samples
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -482,11 +417,14 @@ fn remaining_timeout(deadline: Option<Instant>, fallback: Duration) -> Duration 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
     use std::collections::VecDeque;
+    #[cfg(not(target_arch = "wasm32"))]
     use std::sync::{Arc, Mutex};
 
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[derive(Debug, Default)]
     struct FakeState {
         allocations: usize,
@@ -496,11 +434,13 @@ mod tests {
         ready: VecDeque<Vec<u8>>,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[derive(Clone, Debug, Default)]
     struct FakeBackend {
         state: Arc<Mutex<FakeState>>,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl FakeBackend {
         fn push_completion(&self, bytes: impl Into<Vec<u8>>) {
             self.state.lock().unwrap().ready.push_back(bytes.into());
@@ -553,66 +493,15 @@ mod tests {
         }
     }
 
-    impl AsyncBulkInBackend for FakeBackend {
-        type Buffer = Vec<u8>;
-
-        async fn clear_halt_async(&mut self) -> Result<()> {
-            self.state.lock().unwrap().clear_halt_calls += 1;
-            Ok(())
-        }
-
-        fn allocate(&self, len: usize) -> Self::Buffer {
-            self.state.lock().unwrap().allocations += 1;
-            vec![0; len]
-        }
-
-        fn submit(&mut self, buffer: Self::Buffer) {
-            self.state.lock().unwrap().pending.push_back(buffer);
-        }
-
-        fn pending(&self) -> usize {
-            self.state.lock().unwrap().pending.len()
-        }
-
-        fn poll_next_complete(
-            &mut self,
-            _cx: &mut Context<'_>,
-        ) -> Poll<BulkInCompletion<Self::Buffer>> {
-            self.complete().map_or(Poll::Pending, Poll::Ready)
-        }
-
-        fn cancel_all(&mut self) {
-            self.state.lock().unwrap().cancel_calls += 1;
-        }
-    }
-
     #[test]
     fn cs8_conversion_is_signed_and_normalized() {
         let bytes = [0x80, 0x00, 0x7f, 0xff];
         let mut out = [Complex32::default(); 2];
         let mut offset = 0;
-        let mut pending = None;
-        assert_eq!(convert_cs8(&bytes, &mut out, &mut offset, &mut pending), 2);
+        assert_eq!(convert_cs8(&bytes, &mut out, &mut offset), 2);
         assert_eq!(out[0], Complex32::new(-1.0, 0.0));
         assert_eq!(out[1], Complex32::new(127.0 / 128.0, -1.0 / 128.0));
         assert_eq!(offset, 4);
-        assert_eq!(pending, None);
-    }
-
-    #[test]
-    fn cs8_conversion_carries_i_across_buffers() {
-        let mut out = [Complex32::default(); 1];
-        let mut offset = 0;
-        let mut pending = None;
-        assert_eq!(convert_cs8(&[64], &mut out, &mut offset, &mut pending), 0);
-        assert_eq!(pending, Some(64));
-        let mut next_offset = 0;
-        assert_eq!(
-            convert_cs8(&[192], &mut out, &mut next_offset, &mut pending),
-            1
-        );
-        assert_eq!(out[0], Complex32::new(0.5, -0.5));
-        assert_eq!(pending, None);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -640,15 +529,38 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn blocking_stream_carries_an_odd_i_byte_between_completions() {
+    fn blocking_stream_rejects_an_odd_iq_completion() {
         let backend = FakeBackend::default();
         backend.push_completion([64]);
-        backend.push_completion([192]);
         let mut stream = DirectRxStream::prepare(backend).start_blocking().unwrap();
         let mut out = [Complex32::default(); 1];
-        assert_eq!(stream.read_complex(&mut out, Duration::MAX).unwrap(), 1);
-        assert_eq!(out[0], Complex32::new(0.5, -0.5));
-        assert_eq!(stream.stats.buffers_processed, 2);
+        let error = stream.read_complex(&mut out, Duration::MAX).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Other);
+        assert!(stream.closed);
+        assert_eq!(stream.stats.buffers_received, 1);
+        assert_eq!(stream.stats.buffers_dropped, 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn resetting_stats_retains_the_rx_queue_and_buffered_samples() {
+        let backend = FakeBackend::default();
+        let state = Arc::clone(&backend.state);
+        backend.push_completion([0x80, 0x00, 0x7f, 0xff]);
+        let mut stream = DirectRxStream::prepare(backend).start_blocking().unwrap();
+
+        let mut first = [Complex32::default(); 1];
+        assert_eq!(stream.read_complex(&mut first, Duration::MAX).unwrap(), 1);
+        assert_eq!(stream.stats().buffers_processed, 1);
+        assert_eq!(state.lock().unwrap().pending.len(), TRANSFER_COUNT - 1);
+
+        stream.reset_stats();
+        assert_eq!(stream.stats(), StreamingStats::default());
+        assert_eq!(state.lock().unwrap().cancel_calls, 0);
+
+        let mut second = [Complex32::default(); 1];
+        assert_eq!(stream.read_complex(&mut second, Duration::MAX).unwrap(), 1);
+        assert_eq!(second[0], Complex32::new(127.0 / 128.0, -1.0 / 128.0));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -681,34 +593,5 @@ mod tests {
         assert_eq!(stream.stats.buffers_received, 1);
         assert_eq!(stream.stats.buffers_dropped, 1);
         assert_eq!(state.lock().unwrap().cancel_calls, 1);
-    }
-
-    #[test]
-    fn async_restart_discards_every_retained_submission() {
-        futures_lite::future::block_on(async {
-            let backend = FakeBackend::default();
-            let state = Arc::clone(&backend.state);
-            let mut stream = AsyncDirectRxStream::prepare(backend.clone())
-                .start_async()
-                .await
-                .unwrap();
-            stream.pause().unwrap();
-            for _ in 0..TRANSFER_COUNT {
-                backend.push_completion([0, 0]);
-            }
-            backend.push_completion([64, 192]);
-
-            let mut out = [Complex32::default(); 1];
-            let count = std::future::poll_fn(|cx| stream.poll_read_complex(&mut out, cx))
-                .await
-                .unwrap();
-            assert_eq!(count, 1);
-            assert_eq!(out[0], Complex32::new(0.5, -0.5));
-            assert_eq!(
-                stream.stats().buffers_discarded_on_restart,
-                TRANSFER_COUNT as u64
-            );
-            assert_eq!(state.lock().unwrap().pending.len(), TRANSFER_COUNT);
-        });
     }
 }

@@ -1,8 +1,7 @@
-//! High-level owned HackRF device and receive stream.
+//! High-level owned HackRF device and explicit half-duplex streams.
 
-use std::future::{Future, IntoFuture};
+use std::future::{Future, IntoFuture, poll_fn};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -11,11 +10,14 @@ use nusb::MaybeFuture;
 use crate::Complex32;
 use crate::config::{
     Config, ConfigBuilder, validate_frequency, validate_lna_gain, validate_sample_rate,
-    validate_vga_gain,
+    validate_tx_vga_gain, validate_vga_gain,
 };
 use crate::device::{HackRf, shutdown_hardware};
 use crate::errors::{Error, Result};
 use crate::maybe_future::{MaybeFutureExt, ready};
+use crate::radio::{
+    Direction, ExecutionStyle, LifecycleController, StreamClaim, TxStreamingStats, TxTransport,
+};
 use crate::streaming::{AsyncDirectRxStream, AsyncStreamingBackend, StreamingStats};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::streaming::{DirectRxStream, StreamingBackend};
@@ -27,128 +29,58 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(target_arch = "wasm32")]
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeviceLifecycle {
-    Open,
-    Closing,
-    DropCleanupPending,
-    Closed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReceiverSlot {
-    Idle,
-    Held,
-    Orphaned,
-}
-
 #[derive(Debug)]
-struct SharedDeviceState {
-    device: DeviceLifecycle,
-    receiver: ReceiverSlot,
-    stream_claimed: bool,
-    bias_tee_enabled: bool,
-}
-
-impl SharedDeviceState {
-    fn new(bias_tee_enabled: bool) -> Self {
-        Self {
-            device: DeviceLifecycle::Open,
-            receiver: ReceiverSlot::Idle,
-            stream_claimed: false,
-            bias_tee_enabled,
-        }
-    }
-}
-
-type SharedState = Arc<Mutex<SharedDeviceState>>;
-
-fn lock_shared(state: &SharedState) -> MutexGuard<'_, SharedDeviceState> {
-    state.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn ensure_device_open(state: &SharedState) -> Result<()> {
-    if lock_shared(state).device == DeviceLifecycle::Open {
-        Ok(())
-    } else {
-        Err(Error::DeviceClosed)
-    }
-}
-
-fn desired_bias_tee(state: &SharedState) -> bool {
-    lock_shared(state).bias_tee_enabled
-}
-
-fn begin_shutdown(state: &SharedState) -> Result<bool> {
-    let mut shared = lock_shared(state);
-    match shared.device {
-        DeviceLifecycle::Closed | DeviceLifecycle::DropCleanupPending => Ok(false),
-        DeviceLifecycle::Closing => Ok(true),
-        DeviceLifecycle::Open => {
-            if shared.receiver == ReceiverSlot::Held {
-                return Err(Error::Busy);
-            }
-            shared.device = DeviceLifecycle::Closing;
-            Ok(true)
-        }
-    }
-}
-
-fn complete_shutdown(state: &SharedState, result: Result<()>) -> Result<()> {
-    if result.is_ok() {
-        let mut shared = lock_shared(state);
-        shared.device = DeviceLifecycle::Closed;
-        shared.receiver = ReceiverSlot::Idle;
-    }
-    result
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeviceDropAction {
-    None,
-    Immediate,
-    Deferred,
-}
-
-fn begin_device_drop(state: &SharedState) -> DeviceDropAction {
-    let mut shared = lock_shared(state);
-    match shared.device {
-        DeviceLifecycle::Closed => DeviceDropAction::None,
-        DeviceLifecycle::DropCleanupPending => DeviceDropAction::Deferred,
-        DeviceLifecycle::Open | DeviceLifecycle::Closing => {
-            if shared.receiver == ReceiverSlot::Held {
-                shared.device = DeviceLifecycle::DropCleanupPending;
-                DeviceDropAction::Deferred
-            } else {
-                shared.device = DeviceLifecycle::Closed;
-                shared.receiver = ReceiverSlot::Idle;
-                DeviceDropAction::Immediate
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DeviceInner<C: ControlBackend = NusbControl> {
-    direct: HackRf<C>,
+struct DeviceInner {
+    direct: HackRf<NusbControl>,
     info: DeviceInfo,
     #[cfg(not(target_arch = "wasm32"))]
     shutdown_on_drop: bool,
 }
 
-impl<C: ControlBackend> DeviceInner<C> {
-    fn stream_handle(&self) -> Self {
+/// Ensures a partially initialized device is returned to off mode.
+///
+/// It owns a second handle to the same control interface, leaving the primary
+/// handle available to the opening operation. A completed open consumes this
+/// guard; an error or cancelled future drops it and triggers best-effort
+/// cleanup instead.
+struct OpeningCleanup {
+    direct: Option<HackRf<NusbControl>>,
+}
+
+impl OpeningCleanup {
+    fn new(direct: HackRf<NusbControl>) -> Self {
         Self {
-            direct: self.direct.stream_handle(),
-            info: self.info.clone(),
-            #[cfg(not(target_arch = "wasm32"))]
-            shutdown_on_drop: false,
+            direct: Some(direct),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.direct = None;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for OpeningCleanup {
+    fn drop(&mut self) {
+        if let Some(direct) = self.direct.as_ref() {
+            let _ = shutdown_hardware(direct).wait();
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for OpeningCleanup {
+    fn drop(&mut self) {
+        if let Some(direct) = self.direct.take() {
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = shutdown_hardware(&direct).await;
+            });
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl<C: ControlBackend> Drop for DeviceInner<C> {
+impl Drop for DeviceInner {
     fn drop(&mut self) {
         if self.shutdown_on_drop {
             let _ = shutdown_hardware(&self.direct).wait();
@@ -159,9 +91,156 @@ impl<C: ControlBackend> Drop for DeviceInner<C> {
 /// High-level owned HackRF device handle.
 #[derive(Debug)]
 pub struct Device {
-    inner: DeviceInner<NusbControl>,
+    inner: DeviceInner,
     config: Config,
-    shared: SharedState,
+    radio: std::sync::Arc<LifecycleController>,
+    #[cfg(target_arch = "wasm32")]
+    shutdown_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ConfigOperationKind {
+    Configure(Config),
+    Frequency(u64),
+    SampleRate(u32),
+    LnaGain(u8),
+    VgaGain(u8),
+    TxVgaGain(u8),
+    Amp(bool),
+    BiasTee(bool),
+}
+
+struct ConfigOperation<'a> {
+    device: &'a mut Device,
+    kind: ConfigOperationKind,
+}
+
+impl ConfigOperation<'_> {
+    fn begin(&self, style: ExecutionStyle) -> Result<crate::radio::ReconfigureGuard> {
+        match self.kind {
+            ConfigOperationKind::Configure(_)
+            | ConfigOperationKind::Amp(_)
+            | ConfigOperationKind::BiasTee(_) => {}
+            ConfigOperationKind::Frequency(value) => validate_frequency(value)?,
+            ConfigOperationKind::SampleRate(value) => validate_sample_rate(value)?,
+            ConfigOperationKind::LnaGain(value) => validate_lna_gain(value)?,
+            ConfigOperationKind::VgaGain(value) => validate_vga_gain(value)?,
+            ConfigOperationKind::TxVgaGain(value) => validate_tx_vga_gain(value)?,
+        }
+        self.device.radio.begin_reconfigure(style)
+    }
+
+    fn record_success(&mut self) {
+        match &self.kind {
+            ConfigOperationKind::Configure(config) => {
+                self.device.config = config.clone();
+                self.device
+                    .radio
+                    .set_bias_tee(self.device.config.bias_tee_enabled());
+            }
+            ConfigOperationKind::Frequency(value) => {
+                self.device.config.set_frequency_hz_internal(*value)
+            }
+            ConfigOperationKind::SampleRate(value) => {
+                self.device.config.set_sample_rate_hz_internal(*value)
+            }
+            ConfigOperationKind::LnaGain(value) => {
+                self.device.config.set_lna_gain_db_internal(*value)
+            }
+            ConfigOperationKind::VgaGain(value) => {
+                self.device.config.set_vga_gain_db_internal(*value)
+            }
+            ConfigOperationKind::TxVgaGain(value) => {
+                self.device.config.set_tx_vga_gain_db_internal(*value)
+            }
+            ConfigOperationKind::Amp(value) => self.device.config.set_amp_enabled_internal(*value),
+            ConfigOperationKind::BiasTee(value) => {
+                self.device.config.set_bias_tee_enabled_internal(*value);
+                self.device.radio.set_bias_tee(*value);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(mut self) -> Result<()> {
+        let _guard = self.begin(ExecutionStyle::Blocking)?;
+        let result = match &self.kind {
+            ConfigOperationKind::Configure(config) => {
+                self.device.inner.direct.configure(config).wait()
+            }
+            ConfigOperationKind::Frequency(value) => {
+                self.device.inner.direct.set_frequency(*value).wait()
+            }
+            ConfigOperationKind::SampleRate(value) => {
+                self.device.inner.direct.set_sample_rate(*value).wait()
+            }
+            ConfigOperationKind::LnaGain(value) => {
+                self.device.inner.direct.set_lna_gain(*value).wait()
+            }
+            ConfigOperationKind::VgaGain(value) => {
+                self.device.inner.direct.set_vga_gain(*value).wait()
+            }
+            ConfigOperationKind::TxVgaGain(value) => {
+                self.device.inner.direct.set_tx_vga_gain(*value).wait()
+            }
+            ConfigOperationKind::Amp(value) => self.device.inner.direct.set_amp(*value).wait(),
+            ConfigOperationKind::BiasTee(value) => {
+                self.device.inner.direct.set_bias_tee(*value).wait()
+            }
+        };
+        if result.is_ok() {
+            self.record_success();
+        }
+        result
+    }
+
+    async fn run_async(mut self) -> Result<()> {
+        let _guard = self.begin(ExecutionStyle::Async)?;
+        let result = match &self.kind {
+            ConfigOperationKind::Configure(config) => {
+                self.device.inner.direct.configure(config).await
+            }
+            ConfigOperationKind::Frequency(value) => {
+                self.device.inner.direct.set_frequency(*value).await
+            }
+            ConfigOperationKind::SampleRate(value) => {
+                self.device.inner.direct.set_sample_rate(*value).await
+            }
+            ConfigOperationKind::LnaGain(value) => {
+                self.device.inner.direct.set_lna_gain(*value).await
+            }
+            ConfigOperationKind::VgaGain(value) => {
+                self.device.inner.direct.set_vga_gain(*value).await
+            }
+            ConfigOperationKind::TxVgaGain(value) => {
+                self.device.inner.direct.set_tx_vga_gain(*value).await
+            }
+            ConfigOperationKind::Amp(value) => self.device.inner.direct.set_amp(*value).await,
+            ConfigOperationKind::BiasTee(value) => {
+                self.device.inner.direct.set_bias_tee(*value).await
+            }
+        };
+        if result.is_ok() {
+            self.record_success();
+        }
+        result
+    }
+}
+
+impl<'a> IntoFuture for ConfigOperation<'a> {
+    type Output = Result<()>;
+    type IntoFuture = BoxFuture<'a, Result<()>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.run_async().await })
+    }
+}
+
+impl MaybeFuture for ConfigOperation<'_> {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(self) -> Self::Output {
+        self.wait()
+    }
 }
 
 impl Device {
@@ -203,175 +282,161 @@ impl Device {
         &self.config
     }
 
-    /// Apply a complete validated RX configuration.
-    pub fn configure<'a>(
-        &'a mut self,
-        config: &'a Config,
-    ) -> impl MaybeFuture<Output = Result<()>> + 'a {
-        let lifecycle = ensure_device_open(&self.shared);
-        let applied = config.clone();
-        let active = &mut self.config;
-        let shared = Arc::clone(&self.shared);
-        let operation = self.inner.direct.configure(config);
-        ready(lifecycle)
-            .and_then(move |()| operation)
-            .map(move |result| {
-                if result.is_ok() {
-                    *active = applied;
-                    lock_shared(&shared).bias_tee_enabled = active.bias_tee_enabled();
-                }
-                result
-            })
+    /// Apply a complete validated transceiver configuration while off or streaming.
+    ///
+    /// A live configuration change has no sample-accurate application boundary.
+    pub fn configure(&mut self, config: &Config) -> impl MaybeFuture<Output = Result<()>> + '_ {
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::Configure(config.clone()),
+        }
     }
 
-    /// Change the center frequency while stopped or receiving.
+    /// Change the center frequency while the radio is off or streaming.
+    ///
+    /// A live retune has no sample-accurate application boundary.
     pub fn set_frequency_hz(
         &mut self,
         frequency_hz: u64,
     ) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        let validation =
-            ensure_device_open(&self.shared).and_then(|()| validate_frequency(frequency_hz));
-        let config = &mut self.config;
-        let operation = self.inner.direct.set_frequency(frequency_hz);
-        ready(validation)
-            .and_then(move |()| operation)
-            .map(move |result| {
-                if result.is_ok() {
-                    config.set_frequency_hz_internal(frequency_hz);
-                }
-                result
-            })
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::Frequency(frequency_hz),
+        }
     }
 
-    /// Change the complex sample rate while stopped or receiving.
+    /// Change the complex sample rate while the radio is off or streaming.
     ///
     /// The driver also requests a baseband filter bandwidth equal to this rate.
+    /// A live rate change has no sample-accurate application boundary.
     pub fn set_sample_rate_hz(
         &mut self,
         sample_rate_hz: u32,
     ) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        let validation =
-            ensure_device_open(&self.shared).and_then(|()| validate_sample_rate(sample_rate_hz));
-        let config = &mut self.config;
-        let operation = self.inner.direct.set_sample_rate(sample_rate_hz);
-        ready(validation)
-            .and_then(move |()| operation)
-            .map(move |result| {
-                if result.is_ok() {
-                    config.set_sample_rate_hz_internal(sample_rate_hz);
-                }
-                result
-            })
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::SampleRate(sample_rate_hz),
+        }
     }
 
-    /// Set RX IF/LNA gain in dB.
-    pub fn set_lna_gain_db(&mut self, gain_db: u8) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        let validation = ensure_device_open(&self.shared).and_then(|()| validate_lna_gain(gain_db));
-        let config = &mut self.config;
-        let operation = self.inner.direct.set_lna_gain(gain_db);
-        ready(validation)
-            .and_then(move |()| operation)
-            .map(move |result| {
-                if result.is_ok() {
-                    config.set_lna_gain_db_internal(gain_db);
-                }
-                result
-            })
-    }
-
-    /// Set baseband/VGA gain in dB.
-    pub fn set_vga_gain_db(&mut self, gain_db: u8) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        let validation = ensure_device_open(&self.shared).and_then(|()| validate_vga_gain(gain_db));
-        let config = &mut self.config;
-        let operation = self.inner.direct.set_vga_gain(gain_db);
-        ready(validation)
-            .and_then(move |()| operation)
-            .map(move |result| {
-                if result.is_ok() {
-                    config.set_vga_gain_db_internal(gain_db);
-                }
-                result
-            })
-    }
-
-    /// Enable or disable the RF amplifier.
-    pub fn set_amp_enable(&mut self, enabled: bool) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        let lifecycle = ensure_device_open(&self.shared);
-        let config = &mut self.config;
-        let operation = self.inner.direct.set_amp(enabled);
-        ready(lifecycle)
-            .and_then(move |()| operation)
-            .map(move |result| {
-                if result.is_ok() {
-                    config.set_amp_enabled_internal(enabled);
-                }
-                result
-            })
-    }
-
-    /// Enable or disable antenna-port bias power.
+    /// Set RX IF/LNA gain in dB while the radio is off or streaming.
     ///
-    /// HackRF firmware disables this when reception stops. A later stream start
-    /// automatically reapplies the last successful setting.
+    /// A live gain change has no sample-accurate application boundary.
+    pub fn set_lna_gain_db(&mut self, gain_db: u8) -> impl MaybeFuture<Output = Result<()>> + '_ {
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::LnaGain(gain_db),
+        }
+    }
+
+    /// Set baseband/VGA gain in dB while the radio is off or streaming.
+    ///
+    /// A live gain change has no sample-accurate application boundary.
+    pub fn set_vga_gain_db(&mut self, gain_db: u8) -> impl MaybeFuture<Output = Result<()>> + '_ {
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::VgaGain(gain_db),
+        }
+    }
+
+    /// Set TX VGA gain in dB while the radio is off or streaming.
+    ///
+    /// A live gain change has no sample-accurate application boundary.
+    pub fn set_tx_vga_gain_db(
+        &mut self,
+        gain_db: u8,
+    ) -> impl MaybeFuture<Output = Result<()>> + '_ {
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::TxVgaGain(gain_db),
+        }
+    }
+
+    /// Enable or disable the RF amplifier while the radio is off or streaming.
+    ///
+    /// A live amplifier change has no sample-accurate application boundary.
+    pub fn set_amp_enable(&mut self, enabled: bool) -> impl MaybeFuture<Output = Result<()>> + '_ {
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::Amp(enabled),
+        }
+    }
+
+    /// Enable or disable antenna-port bias power while the radio is off or streaming.
+    ///
+    /// A live bias-power change has no sample-accurate application boundary.
     pub fn set_bias_tee(&mut self, enabled: bool) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        let lifecycle = ensure_device_open(&self.shared);
-        let config = &mut self.config;
-        let shared = Arc::clone(&self.shared);
-        let operation = self.inner.direct.set_bias_tee(enabled);
-        ready(lifecycle)
-            .and_then(move |()| operation)
-            .map(move |result| {
-                if result.is_ok() {
-                    config.set_bias_tee_enabled_internal(enabled);
-                    lock_shared(&shared).bias_tee_enabled = enabled;
-                }
-                result
-            })
+        ConfigOperation {
+            device: self,
+            kind: ConfigOperationKind::BiasTee(enabled),
+        }
     }
 
     /// Claim the device's single owned receive stream.
     ///
-    /// The stream starts dormant. The device remains usable for live setters
-    /// while reception is active. Dropping the stream releases the claim.
+    /// The stream is initially stopped. Call [`RxStream::start`] before
+    /// reading it and [`RxStream::stop`] before starting TX.
     pub fn rx_stream(&self) -> Result<RxStream> {
-        let claim = RxStreamClaim::acquire(&self.shared)?;
+        let claim = self.radio.claim_stream(Direction::Rx)?;
         Ok(RxStream::new(
-            self.inner.stream_handle(),
-            Arc::clone(&self.shared),
+            self.inner.direct.stream_handle(),
+            std::sync::Arc::clone(&self.radio),
             claim,
         ))
     }
 
+    /// Claim the device's single owned transmit stream.
+    ///
+    /// The stream is initially stopped. Call [`TxStream::start`] before
+    /// writing it and [`TxStream::stop`] before starting RX.
+    pub fn tx_stream(&self) -> Result<TxStream> {
+        let claim = self.radio.claim_stream(Direction::Tx)?;
+        Ok(TxStream::new(std::sync::Arc::clone(&self.radio), claim))
+    }
+
     /// Put the transceiver in off mode and close the logical device session.
     ///
-    /// Returns [`Error::Busy`] while a receive stream is running. A stopped but
-    /// still-owned stream does not prevent shutdown, but cannot be restarted.
+    /// Returns [`Error::Busy`] unless both directions have been stopped. Once
+    /// shutdown starts, streams can no longer be started. The session remains
+    /// closed if the hardware request fails or its future is cancelled; drop
+    /// this handle and reopen the device to try again. Dropping the handle
+    /// performs best-effort cleanup on supported targets.
     #[must_use = "shutdown must be waited or awaited to observe hardware cleanup"]
     pub fn shutdown(&mut self) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        let decision = begin_shutdown(&self.shared);
-        let shared = Arc::clone(&self.shared);
-        let operation = shutdown_hardware(&self.inner.direct);
-        ready(decision).and_then(move |run| {
-            if run {
-                crate::maybe_future::Either::left(
-                    operation.map(move |result| complete_shutdown(&shared, result)),
-                )
-            } else {
-                crate::maybe_future::Either::right(ready(Ok(())))
-            }
-        })
+        DeviceShutdownOperation { device: self }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shutdown_blocking(&mut self) -> Result<()> {
+        self.radio.shutdown_blocking()?;
+        self.inner.shutdown_on_drop = false;
+        Ok(())
+    }
+
+    async fn shutdown_async(&mut self) -> Result<()> {
+        self.radio.shutdown_async().await?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.inner.shutdown_on_drop = false;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.shutdown_complete = true;
+        }
+        Ok(())
     }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        let action = begin_device_drop(&self.shared);
+        self.radio.close_on_drop();
         #[cfg(not(target_arch = "wasm32"))]
-        if action != DeviceDropAction::Immediate {
-            self.inner.shutdown_on_drop = false;
+        {
+            // Device drop is deliberately best effort. Streams surviving it
+            // are unsupported and no cleanup outcome is observable.
         }
         #[cfg(target_arch = "wasm32")]
-        if action == DeviceDropAction::Immediate {
+        if !self.shutdown_complete {
             let direct = self.inner.direct.stream_handle();
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = shutdown_hardware(&direct).await;
@@ -418,15 +483,21 @@ impl DeviceBuilder {
         self
     }
 
+    /// Set the initial TX VGA gain.
+    pub fn tx_vga_gain_db(mut self, value: u8) -> Self {
+        self.config = self.config.tx_vga_gain_db(value);
+        self
+    }
+
     /// Set the initial RF amplifier state.
-    pub fn amp_enable(mut self, enabled: bool) -> Self {
-        self.config = self.config.amp_enable(enabled);
+    pub fn amp_enable(mut self, value: bool) -> Self {
+        self.config = self.config.amp_enable(value);
         self
     }
 
     /// Set the initial antenna-port bias-power state.
-    pub fn bias_tee(mut self, enabled: bool) -> Self {
-        self.config = self.config.bias_tee(enabled);
+    pub fn bias_tee(mut self, value: bool) -> Self {
+        self.config = self.config.bias_tee(value);
         self
     }
 
@@ -436,24 +507,35 @@ impl DeviceBuilder {
         let serial = self.serial;
         ready(config).and_then(move |config| {
             HackRf::open(serial).and_then(move |(direct, usb_api_version)| {
+                let cleanup = OpeningCleanup::new(direct.stream_handle());
                 let info = direct.fetch_device_info(usb_api_version);
                 info.and_then(move |info| {
-                    let applied = config.clone();
-                    direct.configure(&config).map(move |result| {
-                        result?;
-                        Ok(Device {
-                            inner: DeviceInner {
-                                direct,
-                                info,
-                                #[cfg(not(target_arch = "wasm32"))]
-                                shutdown_on_drop: true,
-                            },
-                            shared: Arc::new(Mutex::new(SharedDeviceState::new(
-                                applied.bias_tee_enabled(),
-                            ))),
-                            config: applied,
+                    let flush_size = direct.tx_flush_size(info.usb_api_version);
+                    direct
+                        .configure(&config)
+                        .and_then(move |()| flush_size)
+                        .map(move |flush_size| {
+                            let flush_size = flush_size?;
+                            let tx_endpoint = direct.bulk_out()?;
+                            cleanup.disarm();
+                            Ok(Device {
+                                inner: DeviceInner {
+                                    direct: direct.stream_handle(),
+                                    info,
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    shutdown_on_drop: true,
+                                },
+                                radio: LifecycleController::new(
+                                    direct,
+                                    tx_endpoint,
+                                    flush_size,
+                                    config.bias_tee_enabled(),
+                                ),
+                                config,
+                                #[cfg(target_arch = "wasm32")]
+                                shutdown_complete: false,
+                            })
                         })
-                    })
                 })
             })
         })
@@ -470,12 +552,13 @@ impl DeviceBuilder {
 enum ReceiverState {
     Stopped,
     CleanupRequired,
+    Paused,
     Running,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 struct BlockingRxInner<C: ControlBackend + StreamingBackend> {
-    device: DeviceInner<C>,
+    direct: HackRf<C>,
     stream: Option<DirectRxStream<C::BulkIn>>,
     stats: StreamingStats,
     state: ReceiverState,
@@ -486,25 +569,38 @@ impl<C> BlockingRxInner<C>
 where
     C: ControlBackend + StreamingBackend,
 {
-    fn new(device: DeviceInner<C>) -> Self {
+    fn new(direct: HackRf<C>) -> Self {
         Self {
-            device,
+            direct,
             stream: None,
             stats: StreamingStats::default(),
             state: ReceiverState::Stopped,
         }
     }
 
-    fn start(&mut self, bias_tee: bool) -> Result<()> {
+    fn open_queue(&mut self) -> Result<()> {
         match self.state {
             ReceiverState::Running => return Ok(()),
             ReceiverState::CleanupRequired => return Err(Error::Busy),
+            ReceiverState::Paused => {
+                self.stats = StreamingStats::default();
+                self.stream
+                    .as_mut()
+                    .ok_or(Error::stream_closed("RX stream has no USB queue"))?
+                    .reset_stats();
+                return Ok(());
+            }
             ReceiverState::Stopped => {}
         }
+        self.stats = StreamingStats::default();
         self.state = ReceiverState::CleanupRequired;
-        self.stream = Some(self.device.direct.start_rx_blocking(bias_tee)?);
-        self.state = ReceiverState::Running;
+        self.stream = Some(self.direct.start_rx_blocking()?);
         Ok(())
+    }
+
+    fn commit_start(&mut self) {
+        debug_assert!(self.stream.is_some());
+        self.state = ReceiverState::Running;
     }
 
     fn read(&mut self, out: &mut [Complex32], timeout: Duration) -> Result<usize> {
@@ -522,32 +618,38 @@ where
         result
     }
 
-    fn stop(&mut self) -> Result<StreamingStats> {
+    fn close_queue(&mut self) -> StreamingStats {
         if self.state == ReceiverState::Stopped {
-            return Ok(self.stats);
+            return self.stats;
         }
-        let result = if let Some(stream) = self.stream.take() {
-            let (stats, result) = self.device.direct.stop_rx_blocking(stream);
-            self.stats.accumulate(stats);
-            result
+        if let Some(mut stream) = self.stream.take() {
+            self.stats = stream.close();
+        }
+        self.state = ReceiverState::Stopped;
+        self.stats
+    }
+
+    fn pause_queue(&mut self) -> StreamingStats {
+        if self.state == ReceiverState::Running {
+            if let Some(stream) = self.stream.as_mut() {
+                self.stats = stream.stats();
+            }
+            self.state = ReceiverState::Paused;
+        }
+        self.stats
+    }
+
+    fn stop(&mut self) -> StreamingStats {
+        if self.state == ReceiverState::CleanupRequired {
+            self.close_queue()
         } else {
-            shutdown_hardware(&self.device.direct).wait()
-        };
-        match result {
-            Ok(()) => {
-                self.state = ReceiverState::Stopped;
-                Ok(self.stats)
-            }
-            Err(error) => {
-                self.state = ReceiverState::CleanupRequired;
-                Err(error)
-            }
+            self.pause_queue()
         }
     }
 }
 
 struct AsyncRxInner<C: ControlBackend + AsyncStreamingBackend> {
-    device: DeviceInner<C>,
+    direct: HackRf<C>,
     stream: Option<AsyncDirectRxStream<C::BulkIn>>,
     stats: StreamingStats,
     state: ReceiverState,
@@ -557,29 +659,38 @@ impl<C> AsyncRxInner<C>
 where
     C: ControlBackend + AsyncStreamingBackend,
 {
-    fn new(device: DeviceInner<C>) -> Self {
+    fn new(direct: HackRf<C>) -> Self {
         Self {
-            device,
+            direct,
             stream: None,
             stats: StreamingStats::default(),
             state: ReceiverState::Stopped,
         }
     }
 
-    async fn start(&mut self, bias_tee: bool) -> Result<()> {
+    async fn open_queue(&mut self) -> Result<()> {
         match self.state {
             ReceiverState::Running => return Ok(()),
             ReceiverState::CleanupRequired => return Err(Error::Busy),
+            ReceiverState::Paused => {
+                self.stats = StreamingStats::default();
+                self.stream
+                    .as_mut()
+                    .ok_or(Error::stream_closed("async RX stream has no USB queue"))?
+                    .reset_stats();
+                return Ok(());
+            }
             ReceiverState::Stopped => {}
         }
+        self.stats = StreamingStats::default();
         self.state = ReceiverState::CleanupRequired;
-        if self.stream.is_some() {
-            self.device.direct.restart_rx_async(bias_tee).await?;
-        } else {
-            self.stream = Some(self.device.direct.start_rx_async(bias_tee).await?);
-        }
-        self.state = ReceiverState::Running;
+        self.stream = Some(self.direct.start_rx_async().await?);
         Ok(())
+    }
+
+    fn commit_start(&mut self) {
+        debug_assert!(self.stream.is_some());
+        self.state = ReceiverState::Running;
     }
 
     fn poll_read(&mut self, out: &mut [Complex32], cx: &mut Context<'_>) -> Poll<Result<usize>> {
@@ -598,157 +709,84 @@ where
         result
     }
 
-    async fn stop(&mut self) -> Result<StreamingStats> {
+    fn close_queue(&mut self) -> StreamingStats {
         if self.state == ReceiverState::Stopped {
-            return Ok(self.current_stats());
+            return self.stats;
         }
-        if let Some(stream) = self.stream.as_mut() {
-            self.device.direct.stop_rx_async(stream).await?;
+        if let Some(mut stream) = self.stream.take() {
+            self.stats = stream.close();
+        }
+        self.state = ReceiverState::Stopped;
+        self.stats
+    }
+
+    fn pause_queue(&mut self) -> StreamingStats {
+        if self.state == ReceiverState::Running {
+            if let Some(stream) = self.stream.as_mut() {
+                self.stats = stream.stats();
+            }
+            self.state = ReceiverState::Paused;
+        }
+        self.stats
+    }
+
+    fn stop(&mut self) -> StreamingStats {
+        if self.state == ReceiverState::CleanupRequired {
+            self.close_queue()
         } else {
-            shutdown_hardware(&self.device.direct).await?;
+            self.pause_queue()
         }
-        if self
-            .stream
-            .as_ref()
-            .is_some_and(AsyncDirectRxStream::is_closed)
-        {
-            let mut stream = self.stream.take().expect("closed stream checked");
-            self.stats.accumulate(stream.close());
-        }
-        self.state = ReceiverState::Stopped;
-        Ok(self.current_stats())
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn stop_on_drop(&mut self) -> Result<StreamingStats> {
-        if self.state == ReceiverState::Stopped {
-            return Ok(self.current_stats());
-        }
-        shutdown_hardware(&self.device.direct).wait()?;
-        if let Some(stream) = self.stream.as_mut() {
-            stream.pause()?;
-        }
-        self.state = ReceiverState::Stopped;
-        Ok(self.current_stats())
-    }
-
-    fn current_stats(&self) -> StreamingStats {
-        self.stream
-            .as_ref()
-            .map_or(self.stats, |stream| self.stats.combined(stream.stats()))
     }
 }
 
 enum RxStreamState {
-    Dormant(DeviceInner<NusbControl>),
+    Dormant(HackRf<NusbControl>),
     Poisoned,
     #[cfg(not(target_arch = "wasm32"))]
     Blocking(BlockingRxInner<NusbControl>),
     Async(AsyncRxInner<NusbControl>),
 }
 
-#[derive(Debug)]
-struct RxStreamClaim {
-    shared: SharedState,
-}
-
-impl RxStreamClaim {
-    fn acquire(shared: &SharedState) -> Result<Self> {
-        let mut state = lock_shared(shared);
-        if state.device != DeviceLifecycle::Open {
-            return Err(Error::DeviceClosed);
-        }
-        if state.stream_claimed || state.receiver != ReceiverSlot::Idle {
-            return Err(Error::Busy);
-        }
-        state.stream_claimed = true;
-        Ok(Self {
-            shared: Arc::clone(shared),
-        })
-    }
-}
-
-impl Drop for RxStreamClaim {
-    fn drop(&mut self) {
-        lock_shared(&self.shared).stream_claimed = false;
-    }
-}
-
-#[derive(Debug)]
-struct ReceiverLease {
-    shared: SharedState,
-    armed: bool,
-}
-
-impl ReceiverLease {
-    fn acquire(shared: &SharedState) -> Result<Self> {
-        let mut state = lock_shared(shared);
-        if state.device != DeviceLifecycle::Open {
-            return Err(Error::DeviceClosed);
-        }
-        if state.receiver != ReceiverSlot::Idle {
-            return Err(Error::Busy);
-        }
-        state.receiver = ReceiverSlot::Held;
-        Ok(Self {
-            shared: Arc::clone(shared),
-            armed: true,
-        })
-    }
-
-    fn release(mut self) {
-        let mut state = lock_shared(&self.shared);
-        if state.receiver == ReceiverSlot::Held {
-            state.receiver = ReceiverSlot::Idle;
-        }
-        if state.device == DeviceLifecycle::DropCleanupPending {
-            state.device = DeviceLifecycle::Closed;
-        }
-        self.armed = false;
-    }
-}
-
-impl Drop for ReceiverLease {
-    fn drop(&mut self) {
-        if self.armed {
-            let mut state = lock_shared(&self.shared);
-            if state.receiver == ReceiverSlot::Held {
-                state.receiver = ReceiverSlot::Orphaned;
-            }
-        }
-    }
-}
-
 /// Owned HackRF receive stream.
 ///
-/// Waiting the first [`RxStream::start`] chooses native blocking USB; awaiting
-/// it chooses asynchronous USB. Do not mix the two execution styles on one
-/// stream. The steady-state read path owns its endpoint and never takes the
-/// device lifecycle mutex.
-#[must_use = "RX streams retain the device's exclusive stream claim until dropped"]
+/// `start` selects RX while the radio is off. `read` only consumes the owned
+/// RX queue and never switches direction or takes the lifecycle mutex.
+#[must_use = "RX streams retain the device's exclusive RX stream claim until dropped"]
 pub struct RxStream {
     state: RxStreamState,
-    shared: SharedState,
-    receiver: Option<ReceiverLease>,
-    _claim: RxStreamClaim,
+    radio: std::sync::Arc<LifecycleController>,
+    failed: bool,
+    #[cfg(target_arch = "wasm32")]
+    queue_started: bool,
+    _claim: StreamClaim,
 }
 
 impl RxStream {
-    fn new(device: DeviceInner<NusbControl>, shared: SharedState, claim: RxStreamClaim) -> Self {
+    fn new(
+        direct: HackRf<NusbControl>,
+        radio: std::sync::Arc<LifecycleController>,
+        claim: StreamClaim,
+    ) -> Self {
         Self {
-            state: RxStreamState::Dormant(device),
-            shared,
-            receiver: None,
+            state: RxStreamState::Dormant(direct),
+            radio,
+            failed: false,
+            #[cfg(target_arch = "wasm32")]
+            queue_started: false,
             _claim: claim,
         }
     }
 
-    /// Start reception and the persistent USB transfer queue.
+    /// Start or resume RX while the radio is off.
+    ///
+    /// Returns [`Error::Busy`] when TX is active or any control transition is
+    /// in progress. Calling `start` on an already-running RX stream succeeds
+    /// without changing hardware state.
     pub fn start(&mut self) -> impl MaybeFuture<Output = Result<()>> + '_ {
-        StartOperation { stream: self }
+        RxStartOperation { stream: self }
     }
 
-    /// Read normalized complex IQ samples.
+    /// Read normalized complex IQ samples from a started RX stream.
     ///
     /// Blocking operation fills the output until its total timeout expires;
     /// `None` waits indefinitely. Awaited operation ignores the timeout and
@@ -765,9 +803,17 @@ impl RxStream {
         }
     }
 
-    /// Stop reception and return accumulated stream counters.
+    /// Stop RX, turn the radio off, and return counters for this run.
+    ///
+    /// A successful stop retains the RX queue so a later [`Self::start`] can
+    /// resume it without submitting a second queue. Drop the stream for final
+    /// best-effort queue cleanup. A stream I/O failure turns the radio off,
+    /// closes the queue, and permanently invalidates this stream; drop it and
+    /// create a new RX stream before starting again. On WebUSB, dropping an
+    /// RX stream whose queue has started is terminal for RX on this device
+    /// session; drop and reopen the device instead.
     pub fn stop(&mut self) -> impl MaybeFuture<Output = Result<StreamingStats>> + '_ {
-        StopOperation { stream: self }
+        RxStopOperation { stream: self }
     }
 
     fn receiver_state(&self) -> ReceiverState {
@@ -780,27 +826,6 @@ impl RxStream {
         }
     }
 
-    fn begin_start(&mut self) -> Result<bool> {
-        ensure_device_open(&self.shared)?;
-        match (self.receiver.is_some(), self.receiver_state()) {
-            (true, ReceiverState::Running) => Ok(false),
-            (true, ReceiverState::Stopped | ReceiverState::CleanupRequired)
-            | (false, ReceiverState::Running | ReceiverState::CleanupRequired) => Err(Error::Busy),
-            (false, ReceiverState::Stopped) => {
-                self.receiver = Some(ReceiverLease::acquire(&self.shared)?);
-                Ok(true)
-            }
-        }
-    }
-
-    fn finish_stop(&mut self, result: Result<StreamingStats>) -> Result<StreamingStats> {
-        let stats = result?;
-        if let Some(receiver) = self.receiver.take() {
-            receiver.release();
-        }
-        Ok(stats)
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     fn initialize_blocking(&mut self) -> Result<()> {
         if matches!(self.state, RxStreamState::Blocking(_)) {
@@ -811,8 +836,8 @@ impl RxStream {
         }
         let state = core::mem::replace(&mut self.state, RxStreamState::Poisoned);
         match state {
-            RxStreamState::Dormant(device) => {
-                self.state = RxStreamState::Blocking(BlockingRxInner::new(device));
+            RxStreamState::Dormant(direct) => {
+                self.state = RxStreamState::Blocking(BlockingRxInner::new(direct));
                 Ok(())
             }
             other => {
@@ -832,8 +857,8 @@ impl RxStream {
         }
         let state = core::mem::replace(&mut self.state, RxStreamState::Poisoned);
         match state {
-            RxStreamState::Dormant(device) => {
-                self.state = RxStreamState::Async(AsyncRxInner::new(device));
+            RxStreamState::Dormant(direct) => {
+                self.state = RxStreamState::Async(AsyncRxInner::new(direct));
                 Ok(())
             }
             other => {
@@ -845,101 +870,179 @@ impl RxStream {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn start_blocking(&mut self) -> Result<()> {
+        if self.failed {
+            return Err(self.failed_error());
+        }
+        match self.receiver_state() {
+            ReceiverState::Running => return Ok(()),
+            ReceiverState::CleanupRequired => return Err(Error::Busy),
+            ReceiverState::Stopped | ReceiverState::Paused => {}
+        }
+        let mut transition = self.radio.begin_rx_start_blocking()?;
         self.initialize_blocking()?;
-        if !self.begin_start()? {
-            return Ok(());
-        }
-        let bias = desired_bias_tee(&self.shared);
         match &mut self.state {
-            RxStreamState::Blocking(stream) => stream.start(bias),
-            _ => Err(Error::Busy),
+            RxStreamState::Blocking(stream) => stream.open_queue()?,
+            _ => return Err(Error::Busy),
         }
+        transition.finish_blocking()?;
+        if let RxStreamState::Blocking(stream) = &mut self.state {
+            stream.commit_start();
+        }
+        Ok(())
     }
 
     async fn start_async(&mut self) -> Result<()> {
+        if self.failed {
+            return Err(self.failed_error());
+        }
+        match self.receiver_state() {
+            ReceiverState::Running => return Ok(()),
+            ReceiverState::CleanupRequired => return Err(Error::Busy),
+            ReceiverState::Stopped | ReceiverState::Paused => {}
+        }
+        let mut transition = self.radio.begin_rx_start_async().await?;
         self.initialize_async()?;
-        if !self.begin_start()? {
-            return Ok(());
-        }
-        let bias = desired_bias_tee(&self.shared);
         match &mut self.state {
-            RxStreamState::Async(stream) => stream.start(bias).await,
-            _ => Err(Error::Busy),
+            RxStreamState::Async(stream) => stream.open_queue().await?,
+            _ => return Err(Error::Busy),
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // `open_queue` submits every browser transfer synchronously after
+            // its final await, so a successful return proves this stream owns
+            // the non-cancellable WebUSB queue.
+            self.queue_started = true;
+        }
+        transition.finish_async().await?;
+        if let RxStreamState::Async(stream) = &mut self.state {
+            stream.commit_start();
+        }
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn read_blocking(&mut self, out: &mut [Complex32], timeout: Duration) -> Result<usize> {
+        if self.receiver_state() != ReceiverState::Running {
+            return Err(Error::stream_closed("RX stream is stopped"));
+        }
         match &mut self.state {
-            RxStreamState::Blocking(stream) => stream.read(out, timeout),
-            _ => Err(Error::stream_closed(
-                "RX stream is not running synchronously",
-            )),
+            RxStreamState::Blocking(stream) => {
+                let result = stream.read(out, timeout);
+                if let Err(error) = result {
+                    self.failed = true;
+                    self.radio.mark_stream_failed(Direction::Rx);
+                    return match self.stop_blocking() {
+                        Ok(_) => Err(error),
+                        Err(cleanup_error) => {
+                            Err(cleanup_error.at("turn radio off after RX failure"))
+                        }
+                    };
+                }
+                result
+            }
+            RxStreamState::Async(_) => Err(Error::Busy),
+            RxStreamState::Dormant(_) => Err(Error::stream_closed("RX stream is not started")),
+            RxStreamState::Poisoned => Err(Error::stream_closed("RX stream requires stop")),
         }
     }
 
-    fn begin_read_async(&mut self) -> Result<()> {
-        match &self.state {
-            RxStreamState::Async(stream) if stream.state == ReceiverState::Running => Ok(()),
-            _ => Err(Error::stream_closed(
-                "RX stream is not running asynchronously",
-            )),
+    async fn read_async(&mut self, out: &mut [Complex32]) -> Result<usize> {
+        if self.receiver_state() != ReceiverState::Running {
+            return Err(Error::stream_closed("RX stream is stopped"));
         }
-    }
-
-    fn poll_read_async(
-        &mut self,
-        out: &mut [Complex32],
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<usize>> {
         match &mut self.state {
-            RxStreamState::Async(stream) => stream.poll_read(out, cx),
-            _ => Poll::Ready(Err(Error::stream_closed(
-                "RX stream is not running asynchronously",
-            ))),
+            RxStreamState::Async(stream) => {
+                let result = poll_fn(|cx| stream.poll_read(out, cx)).await;
+                if let Err(error) = result {
+                    self.failed = true;
+                    self.radio.mark_stream_failed(Direction::Rx);
+                    return match self.stop_async().await {
+                        Ok(_) => Err(error),
+                        Err(cleanup_error) => {
+                            Err(cleanup_error.at("turn radio off after RX failure"))
+                        }
+                    };
+                }
+                result
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            RxStreamState::Blocking(_) => Err(Error::Busy),
+            RxStreamState::Dormant(_) => Err(Error::stream_closed("RX stream is not started")),
+            RxStreamState::Poisoned => Err(Error::stream_closed("RX stream requires stop")),
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn stop_blocking(&mut self) -> Result<StreamingStats> {
-        let result = match &mut self.state {
-            RxStreamState::Dormant(_) => Ok(StreamingStats::default()),
+        if matches!(self.state, RxStreamState::Async(_)) {
+            return Err(Error::Busy);
+        }
+        let transition = self.radio.begin_stop_blocking(Direction::Rx)?;
+        let stats = match &mut self.state {
+            RxStreamState::Dormant(_) | RxStreamState::Poisoned => StreamingStats::default(),
             RxStreamState::Blocking(stream) => stream.stop(),
-            RxStreamState::Async(_) => Err(Error::Busy),
-            RxStreamState::Poisoned => Err(Error::stream_closed("RX stream has no device")),
+            RxStreamState::Async(_) => return Err(Error::Busy),
         };
-        self.finish_stop(result)
+        if let Some(mut transition) = transition {
+            transition.finish_blocking()?;
+        }
+        Ok(stats)
     }
 
     async fn stop_async(&mut self) -> Result<StreamingStats> {
-        let result = match &mut self.state {
-            RxStreamState::Dormant(_) => Ok(StreamingStats::default()),
-            RxStreamState::Async(stream) => stream.stop().await,
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(self.state, RxStreamState::Blocking(_)) {
+            return Err(Error::Busy);
+        }
+        let transition = self.radio.begin_stop_async(Direction::Rx).await?;
+        #[cfg(target_arch = "wasm32")]
+        if self.receiver_state() == ReceiverState::CleanupRequired {
+            // Closing the queue drops browser-owned transfer promises that
+            // WebUSB cannot cancel. Do this before the close so the same
+            // stream cannot create a replacement queue after recovery.
+            self.abandon_webusb_queue();
+        }
+        let stats = match &mut self.state {
+            RxStreamState::Dormant(_) | RxStreamState::Poisoned => StreamingStats::default(),
+            RxStreamState::Async(stream) => stream.stop(),
             #[cfg(not(target_arch = "wasm32"))]
-            RxStreamState::Blocking(_) => Err(Error::Busy),
-            RxStreamState::Poisoned => Err(Error::stream_closed("RX stream has no device")),
+            RxStreamState::Blocking(_) => return Err(Error::Busy),
         };
-        self.finish_stop(result)
+        if let Some(mut transition) = transition {
+            transition.finish_async().await?;
+        }
+        Ok(stats)
+    }
+
+    fn failed_error(&self) -> Error {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Error::stream_closed("RX stream failed; drop it and create a new RX stream")
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Error::stream_closed("RX stream failed; drop and reopen the WebUSB device")
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn control_handle(&self) -> Option<HackRf<NusbControl>> {
-        match &self.state {
-            RxStreamState::Dormant(device) => Some(device.direct.stream_handle()),
-            #[cfg(not(target_arch = "wasm32"))]
-            RxStreamState::Blocking(stream) => Some(stream.device.direct.stream_handle()),
-            RxStreamState::Async(stream) => Some(stream.device.direct.stream_handle()),
-            RxStreamState::Poisoned => None,
+    fn abandon_webusb_queue(&mut self) {
+        if self.queue_started {
+            self.failed = true;
+            self.radio.mark_rx_queue_abandoned();
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn cleanup_on_drop(&mut self) -> Result<()> {
+    fn close_queue_on_drop(&mut self) {
         match &mut self.state {
-            RxStreamState::Dormant(_) => Ok(()),
-            RxStreamState::Blocking(stream) => stream.stop().map(|_| ()),
-            RxStreamState::Async(stream) => stream.stop_on_drop().map(|_| ()),
-            RxStreamState::Poisoned => Err(Error::stream_closed("RX stream has no device")),
+            RxStreamState::Dormant(_) | RxStreamState::Poisoned => {}
+            RxStreamState::Blocking(stream) => {
+                stream.close_queue();
+            }
+            RxStreamState::Async(stream) => {
+                stream.close_queue();
+            }
         }
     }
 }
@@ -947,30 +1050,317 @@ impl RxStream {
 impl Drop for RxStream {
     fn drop(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        if self.receiver.is_some()
-            && self.cleanup_on_drop().is_ok()
-            && let Some(receiver) = self.receiver.take()
-        {
-            receiver.release();
+        if let Ok(Some(mut transition)) = self.radio.begin_stop_on_drop_blocking(Direction::Rx) {
+            self.close_queue_on_drop();
+            let _ = transition.finish_blocking();
         }
         #[cfg(target_arch = "wasm32")]
-        if let Some(direct) = self.control_handle()
-            && let Some(receiver) = self.receiver.take()
         {
+            self.abandon_webusb_queue();
+            let radio = std::sync::Arc::clone(&self.radio);
             wasm_bindgen_futures::spawn_local(async move {
-                if shutdown_hardware(&direct).await.is_ok() {
-                    receiver.release();
+                if let Ok(Some(mut transition)) = radio.begin_stop_async(Direction::Rx).await {
+                    let _ = transition.finish_async().await;
                 }
             });
         }
     }
 }
 
-struct StartOperation<'a> {
+/// Owned HackRF transmit stream.
+///
+/// `start` selects TX while the radio is off. `write` owns the TX transport
+/// directly and never changes direction or takes the lifecycle mutex.
+#[must_use = "TX streams retain the device's exclusive TX stream claim until dropped"]
+pub struct TxStream {
+    radio: std::sync::Arc<LifecycleController>,
+    transport: Option<TxTransport>,
+    style: Option<ExecutionStyle>,
+    state: TxStreamState,
+    failed: bool,
+    _claim: StreamClaim,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TxStreamState {
+    Dormant,
+    Active,
+    Recovery,
+}
+
+impl TxStream {
+    fn new(radio: std::sync::Arc<LifecycleController>, claim: StreamClaim) -> Self {
+        Self {
+            radio,
+            transport: None,
+            style: None,
+            state: TxStreamState::Dormant,
+            failed: false,
+            _claim: claim,
+        }
+    }
+
+    /// Start TX while the radio is off.
+    ///
+    /// Returns [`Error::Busy`] when RX is active or any control transition is
+    /// in progress. Calling `start` on an already-running TX stream succeeds
+    /// without changing hardware state.
+    pub fn start(&mut self) -> impl MaybeFuture<Output = Result<()>> + '_ {
+        TxStartOperation { stream: self }
+    }
+
+    /// Queue normalized complex IQ samples on a started TX stream.
+    ///
+    /// Blocking calls honor `timeout`; awaited calls use asynchronous USB and
+    /// ignore it. `end_burst` appends the terminal zero-filled flush used by
+    /// libhackrf. If a timeout leaves that flush pending, the next write or
+    /// `stop` submits it before accepting a later burst.
+    pub fn write<'a>(
+        &'a mut self,
+        samples: &'a [Complex32],
+        timeout: Option<Duration>,
+        end_burst: bool,
+    ) -> impl MaybeFuture<Output = Result<usize>> + 'a {
+        TxWriteOperation {
+            stream: self,
+            samples,
+            timeout,
+            end_burst,
+        }
+    }
+
+    /// Flush and drain accepted samples, then turn the radio off.
+    ///
+    /// If the normal 16-transfer TX backpressure window is full, the terminal
+    /// flush may temporarily submit one additional transfer before draining.
+    /// This deliberately preserves the requested end-of-burst boundary.
+    ///
+    /// A successful stop leaves the stream reusable. After a stream I/O
+    /// failure, `stop` still attempts to turn the radio off and permanently
+    /// invalidates this stream. If draining the endpoint fails, reopen the
+    /// device before transmitting again because its pending transfers cannot
+    /// be safely reused.
+    pub fn stop(&mut self) -> impl MaybeFuture<Output = Result<TxStreamingStats>> + '_ {
+        TxStopOperation { stream: self }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_blocking(&mut self) -> Result<()> {
+        if self.failed {
+            return Err(Error::stream_closed(
+                "TX stream failed; drop it and create a new TX stream",
+            ));
+        }
+        match self.state {
+            TxStreamState::Active => return Ok(()),
+            TxStreamState::Recovery => return Err(Error::Busy),
+            TxStreamState::Dormant => {}
+        }
+        let mut transition = self.radio.begin_tx_start_blocking()?;
+        let transport = transition.finish_blocking()?;
+        self.transport = Some(transport);
+        self.style = Some(ExecutionStyle::Blocking);
+        self.state = TxStreamState::Active;
+        Ok(())
+    }
+
+    async fn start_async(&mut self) -> Result<()> {
+        if self.failed {
+            return Err(Error::stream_closed(
+                "TX stream failed; drop it and create a new TX stream",
+            ));
+        }
+        match self.state {
+            TxStreamState::Active => return Ok(()),
+            TxStreamState::Recovery => return Err(Error::Busy),
+            TxStreamState::Dormant => {}
+        }
+        let mut transition = self.radio.begin_tx_start_async().await?;
+        let transport = transition.finish_async().await?;
+        self.transport = Some(transport);
+        self.style = Some(ExecutionStyle::Async);
+        self.state = TxStreamState::Active;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_blocking(
+        &mut self,
+        samples: &[Complex32],
+        timeout: Duration,
+        end_burst: bool,
+    ) -> Result<usize> {
+        match self.state {
+            TxStreamState::Active => {}
+            TxStreamState::Dormant | TxStreamState::Recovery => {
+                return Err(Error::stream_closed("TX stream is not started"));
+            }
+        }
+        if self.style != Some(ExecutionStyle::Blocking) {
+            return Err(Error::Busy);
+        }
+        let result = self
+            .transport
+            .as_mut()
+            .ok_or(Error::stream_closed("TX stream has no transport"))?
+            .write_blocking(samples, timeout, end_burst);
+        if let Err(error) = result {
+            self.failed = true;
+            self.state = TxStreamState::Recovery;
+            self.radio.mark_stream_failed(Direction::Tx);
+            return match self.stop_blocking() {
+                Ok(_) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error.at("turn radio off after TX failure")),
+            };
+        }
+        result
+    }
+
+    async fn write_async(&mut self, samples: &[Complex32], end_burst: bool) -> Result<usize> {
+        match self.state {
+            TxStreamState::Active => {}
+            TxStreamState::Dormant | TxStreamState::Recovery => {
+                return Err(Error::stream_closed("TX stream is not started"));
+            }
+        }
+        if self.style != Some(ExecutionStyle::Async) {
+            return Err(Error::Busy);
+        }
+        let result = match self.transport.as_mut() {
+            Some(transport) => transport.write_async(samples, end_burst).await,
+            None => Err(Error::stream_closed("TX stream has no transport")),
+        };
+        if let Err(error) = result {
+            self.failed = true;
+            self.state = TxStreamState::Recovery;
+            self.radio.mark_stream_failed(Direction::Tx);
+            return match self.stop_async().await {
+                Ok(_) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error.at("turn radio off after TX failure")),
+            };
+        }
+        result
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stop_blocking(&mut self) -> Result<TxStreamingStats> {
+        let transition = self.radio.begin_stop_blocking(Direction::Tx)?;
+        self.state = TxStreamState::Recovery;
+        let (stats, drain_error) = if let Some(transport) = self.transport.as_mut() {
+            match transport.flush_and_drain_blocking() {
+                Ok(()) => (transport.stats(), None),
+                Err(error) => {
+                    self.failed = true;
+                    transport.mark_unusable();
+                    (transport.stats(), Some(error))
+                }
+            }
+        } else {
+            (TxStreamingStats::default(), None)
+        };
+        if let Some(mut transition) = transition
+            && let Err(error) = transition.finish_blocking()
+        {
+            self.state = TxStreamState::Recovery;
+            return Err(match drain_error {
+                Some(_) => error.at("turn radio off after TX drain failure"),
+                None => error,
+            });
+        }
+        if let Some(transport) = self.transport.take()
+            && transport.is_reusable()
+        {
+            self.radio.return_tx_transport(transport);
+        }
+        self.state = TxStreamState::Dormant;
+        drain_error.map_or(Ok(stats), Err)
+    }
+
+    async fn stop_async(&mut self) -> Result<TxStreamingStats> {
+        let transition = self.radio.begin_stop_async(Direction::Tx).await?;
+        self.state = TxStreamState::Recovery;
+        let (stats, drain_error) = if let Some(transport) = self.transport.as_mut() {
+            match transport.flush_and_drain_async().await {
+                Ok(()) => (transport.stats(), None),
+                Err(error) => {
+                    self.failed = true;
+                    transport.mark_unusable();
+                    (transport.stats(), Some(error))
+                }
+            }
+        } else {
+            (TxStreamingStats::default(), None)
+        };
+        if let Some(mut transition) = transition
+            && let Err(error) = transition.finish_async().await
+        {
+            self.state = TxStreamState::Recovery;
+            return Err(match drain_error {
+                Some(_) => error.at("turn radio off after TX drain failure"),
+                None => error,
+            });
+        }
+        if let Some(transport) = self.transport.take()
+            && transport.is_reusable()
+        {
+            self.radio.return_tx_transport(transport);
+        }
+        self.state = TxStreamState::Dormant;
+        drain_error.map_or(Ok(stats), Err)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stop_on_drop_blocking(&mut self) {
+        let Ok(Some(mut transition)) = self.radio.begin_stop_on_drop_blocking(Direction::Tx) else {
+            return;
+        };
+        let drain_succeeded = self
+            .transport
+            .as_mut()
+            .map(|transport| transport.flush_and_drain_blocking().is_ok())
+            .unwrap_or(true);
+        if transition.finish_blocking().is_ok()
+            && drain_succeeded
+            && let Some(transport) = self.transport.take()
+            && transport.is_reusable()
+        {
+            self.radio.return_tx_transport(transport);
+        }
+    }
+}
+
+impl Drop for TxStream {
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.stop_on_drop_blocking();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let radio = std::sync::Arc::clone(&self.radio);
+            let mut transport = self.transport.take();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(Some(mut transition)) = radio.begin_stop_async(Direction::Tx).await {
+                    let drain_succeeded = match transport.as_mut() {
+                        Some(transport) => transport.flush_and_drain_async().await.is_ok(),
+                        None => true,
+                    };
+                    if transition.finish_async().await.is_ok()
+                        && drain_succeeded
+                        && let Some(transport) = transport.take()
+                        && transport.is_reusable()
+                    {
+                        radio.return_tx_transport(transport);
+                    }
+                }
+            });
+        }
+    }
+}
+
+struct RxStartOperation<'a> {
     stream: &'a mut RxStream,
 }
 
-impl<'a> IntoFuture for StartOperation<'a> {
+impl<'a> IntoFuture for RxStartOperation<'a> {
     type Output = Result<()>;
     type IntoFuture = BoxFuture<'a, Result<()>>;
 
@@ -979,18 +1369,18 @@ impl<'a> IntoFuture for StartOperation<'a> {
     }
 }
 
-impl MaybeFuture for StartOperation<'_> {
+impl MaybeFuture for RxStartOperation<'_> {
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(self) -> Self::Output {
         self.stream.start_blocking()
     }
 }
 
-struct StopOperation<'a> {
+struct RxStopOperation<'a> {
     stream: &'a mut RxStream,
 }
 
-impl<'a> IntoFuture for StopOperation<'a> {
+impl<'a> IntoFuture for RxStopOperation<'a> {
     type Output = Result<StreamingStats>;
     type IntoFuture = BoxFuture<'a, Result<StreamingStats>>;
 
@@ -999,7 +1389,75 @@ impl<'a> IntoFuture for StopOperation<'a> {
     }
 }
 
-impl MaybeFuture for StopOperation<'_> {
+impl MaybeFuture for RxStopOperation<'_> {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(self) -> Self::Output {
+        self.stream.stop_blocking()
+    }
+}
+
+struct TxStartOperation<'a> {
+    stream: &'a mut TxStream,
+}
+
+impl<'a> IntoFuture for TxStartOperation<'a> {
+    type Output = Result<()>;
+    type IntoFuture = BoxFuture<'a, Result<()>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.stream.start_async().await })
+    }
+}
+
+impl MaybeFuture for TxStartOperation<'_> {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(self) -> Self::Output {
+        self.stream.start_blocking()
+    }
+}
+
+struct TxWriteOperation<'a> {
+    stream: &'a mut TxStream,
+    samples: &'a [Complex32],
+    timeout: Option<Duration>,
+    end_burst: bool,
+}
+
+impl<'a> IntoFuture for TxWriteOperation<'a> {
+    type Output = Result<usize>;
+    type IntoFuture = BoxFuture<'a, Result<usize>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let _ = self.timeout;
+        Box::pin(async move { self.stream.write_async(self.samples, self.end_burst).await })
+    }
+}
+
+impl MaybeFuture for TxWriteOperation<'_> {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(self) -> Self::Output {
+        self.stream.write_blocking(
+            self.samples,
+            self.timeout.unwrap_or(Duration::MAX),
+            self.end_burst,
+        )
+    }
+}
+
+struct TxStopOperation<'a> {
+    stream: &'a mut TxStream,
+}
+
+impl<'a> IntoFuture for TxStopOperation<'a> {
+    type Output = Result<TxStreamingStats>;
+    type IntoFuture = BoxFuture<'a, Result<TxStreamingStats>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.stream.stop_async().await })
+    }
+}
+
+impl MaybeFuture for TxStopOperation<'_> {
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(self) -> Self::Output {
         self.stream.stop_blocking()
@@ -1014,16 +1472,11 @@ struct ReadOperation<'a> {
 
 impl<'a> IntoFuture for ReadOperation<'a> {
     type Output = Result<usize>;
-    type IntoFuture = ReadFuture<'a>;
+    type IntoFuture = BoxFuture<'a, Result<usize>>;
 
     fn into_future(self) -> Self::IntoFuture {
         let _ = self.timeout;
-        ReadFuture {
-            stream: self.stream,
-            out: self.out,
-            initialized: false,
-            completed: false,
-        }
+        Box::pin(async move { self.stream.read_async(self.out).await })
     }
 }
 
@@ -1035,78 +1488,22 @@ impl MaybeFuture for ReadOperation<'_> {
     }
 }
 
-struct ReadFuture<'a> {
-    stream: &'a mut RxStream,
-    out: &'a mut [Complex32],
-    initialized: bool,
-    completed: bool,
+struct DeviceShutdownOperation<'a> {
+    device: &'a mut Device,
 }
 
-impl Future for ReadFuture<'_> {
-    type Output = Result<usize>;
+impl<'a> IntoFuture for DeviceShutdownOperation<'a> {
+    type Output = Result<()>;
+    type IntoFuture = BoxFuture<'a, Result<()>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        assert!(!this.completed, "read future polled after completion");
-        if !this.initialized {
-            if let Err(error) = this.stream.begin_read_async() {
-                this.completed = true;
-                return Poll::Ready(Err(error));
-            }
-            this.initialized = true;
-        }
-        match this.stream.poll_read_async(this.out, cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                this.completed = true;
-                Poll::Ready(result)
-            }
-        }
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.device.shutdown_async().await })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn shared_state() -> SharedState {
-        Arc::new(Mutex::new(SharedDeviceState::new(false)))
-    }
-
-    #[test]
-    fn stream_claim_is_exclusive_and_released_on_drop() {
-        let shared = shared_state();
-        let claim = RxStreamClaim::acquire(&shared).unwrap();
-        assert_eq!(
-            RxStreamClaim::acquire(&shared).unwrap_err().kind(),
-            crate::ErrorKind::Busy
-        );
-        drop(claim);
-        assert!(RxStreamClaim::acquire(&shared).is_ok());
-    }
-
-    #[test]
-    fn shutdown_is_busy_only_while_receiver_lease_is_held() {
-        let shared = shared_state();
-        let receiver = ReceiverLease::acquire(&shared).unwrap();
-        assert_eq!(
-            begin_shutdown(&shared).unwrap_err().kind(),
-            crate::ErrorKind::Busy
-        );
-        receiver.release();
-        assert!(begin_shutdown(&shared).unwrap());
-    }
-
-    #[test]
-    fn device_drop_defers_closed_state_to_active_receiver() {
-        let shared = shared_state();
-        let receiver = ReceiverLease::acquire(&shared).unwrap();
-        assert_eq!(begin_device_drop(&shared), DeviceDropAction::Deferred);
-        assert_eq!(
-            lock_shared(&shared).device,
-            DeviceLifecycle::DropCleanupPending
-        );
-        receiver.release();
-        assert_eq!(lock_shared(&shared).device, DeviceLifecycle::Closed);
+impl MaybeFuture for DeviceShutdownOperation<'_> {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(self) -> Self::Output {
+        self.device.shutdown_blocking()
     }
 }

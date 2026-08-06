@@ -3,7 +3,7 @@ name = "hackrf-nusb"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Rust-native HackRF RX driver built on nusb."
+description = "Rust-native half-duplex HackRF driver built on nusb."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/hackrf-nusb"
@@ -17,6 +17,7 @@ tokio = ["nusb/tokio"]
 smol = ["nusb/smol"]
 
 [dependencies]
+atomic-waker = "1"
 nusb = "0.2.7"
 num-complex = "0.4"
 

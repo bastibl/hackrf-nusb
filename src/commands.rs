@@ -13,7 +13,9 @@ pub(crate) enum VendorRequest {
     BoardPartIdSerialNoRead = 18,
     SetLnaGain = 19,
     SetVgaGain = 20,
+    SetTxVgaGain = 21,
     AntennaEnable = 23,
+    GetBufferSize = 61,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,4 +23,5 @@ pub(crate) enum VendorRequest {
 pub(crate) enum TransceiverMode {
     Off = 0,
     Receive = 1,
+    Transmit = 2,
 }

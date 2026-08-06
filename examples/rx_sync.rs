@@ -3,15 +3,21 @@
 //! The default invocation prints usage and exits without touching USB. Pass
 //! `--run` only when a HackRF is connected and USB permissions are configured.
 
-use std::env;
-use std::time::Duration;
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    eprintln!("rx_sync is not available on wasm32; use rx_async instead.");
+}
 
-use hackrf_nusb::{Complex32, Device, MaybeFuture};
-
-const EXAMPLE_FREQ_HZ: u64 = 100_000_000;
-const EXAMPLE_SAMPLE_RATE_HZ: u32 = 10_000_000;
-
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> hackrf_nusb::Result<()> {
+    use std::env;
+    use std::time::Duration;
+
+    use hackrf_nusb::{Complex32, Device, MaybeFuture};
+
+    const EXAMPLE_FREQ_HZ: u64 = 100_000_000;
+    const EXAMPLE_SAMPLE_RATE_HZ: u32 = 10_000_000;
+
     let args = env::args().skip(1).collect::<Vec<_>>();
     if !args.iter().any(|arg| arg == "--run") {
         print_usage();
@@ -40,8 +46,8 @@ fn main() -> hackrf_nusb::Result<()> {
 
     if run_rx {
         let mut rx = device.rx_stream()?;
-        rx.start().wait()?;
         let mut samples = [Complex32::default(); 4096];
+        rx.start().wait()?;
         let count = rx.read(&mut samples, Some(Duration::from_secs(1))).wait()?;
         let stats = rx.stop().wait()?;
         drop(rx);
@@ -57,6 +63,7 @@ fn main() -> hackrf_nusb::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn print_usage() {
     eprintln!(
         "This example opens and configures real HackRF hardware.\n\

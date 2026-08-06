@@ -6,15 +6,19 @@ use nusb::MaybeFuture;
 
 use crate::commands::TransceiverMode;
 use crate::config::Config;
-use crate::constants::{RX_ENDPOINT, USB_CONFIGURATION, USB_INTERFACE, VERSION_STRING_SIZE};
+use crate::constants::{
+    RX_ENDPOINT, TX_ENDPOINT, USB_CONFIGURATION, USB_INTERFACE, VERSION_STRING_SIZE,
+};
 use crate::discovery;
 use crate::errors::{Error, Result};
-use crate::maybe_future::MaybeFutureExt;
+use crate::maybe_future::{Either, MaybeFutureExt, ready};
 use crate::streaming::{AsyncDirectRxStream, AsyncStreamingBackend};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::streaming::{DirectRxStream, StreamingBackend, StreamingStats};
+use crate::streaming::{DirectRxStream, StreamingBackend};
 use crate::types::{BoardId, DeviceInfo, PartIdSerial};
-use crate::usb::{ControlBackend, NusbControl, VendorControlRequest, decode_part_id_serial};
+use crate::usb::{
+    ControlBackend, NusbBulkOut, NusbControl, VendorControlRequest, decode_part_id_serial,
+};
 
 #[derive(Debug)]
 pub(crate) struct HackRf<C = NusbControl> {
@@ -81,6 +85,14 @@ impl<C: ControlBackend> HackRf<C> {
             .map(|result| validate_gain_response(result?, "set VGA gain"))
     }
 
+    pub(crate) fn set_tx_vga_gain(
+        &self,
+        gain_db: u8,
+    ) -> impl MaybeFuture<Output = Result<()>> + use<C> {
+        self.control_in_exact(VendorControlRequest::set_tx_vga_gain(gain_db), 1)
+            .map(|result| validate_gain_response(result?, "set TX VGA gain"))
+    }
+
     pub(crate) fn set_amp(&self, enabled: bool) -> impl MaybeFuture<Output = Result<()>> + use<C> {
         self.control
             .control_out(VendorControlRequest::set_amp(enabled))
@@ -114,6 +126,33 @@ impl<C: ControlBackend> HackRf<C> {
             .map(|result| result.and_then(|bytes| decode_part_id_serial(&bytes)))
     }
 
+    pub(crate) fn tx_flush_size(
+        &self,
+        usb_api_version: u16,
+    ) -> impl MaybeFuture<Output = Result<usize>> + use<C> {
+        if usb_api_version >= 0x0112 {
+            Either::left(
+                self.control_in_exact(VendorControlRequest::get_buffer_size(), 4)
+                    .map(|result| {
+                        let bytes: [u8; 4] = result?
+                            .try_into()
+                            .expect("exact control response length was validated");
+                        let size = u32::from_le_bytes(bytes) as usize;
+                        if size == 0 {
+                            Err(Error::protocol(
+                                "read TX flush size",
+                                "firmware returned a zero buffer size",
+                            ))
+                        } else {
+                            Ok(size)
+                        }
+                    }),
+            )
+        } else {
+            Either::right(ready(Ok(32 * 1024)))
+        }
+    }
+
     pub(crate) fn fetch_device_info(
         &self,
         usb_api_version: u16,
@@ -141,11 +180,13 @@ impl<C: ControlBackend> HackRf<C> {
         let frequency = self.set_frequency(config.frequency_hz());
         let lna = self.set_lna_gain(config.lna_gain_db());
         let vga = self.set_vga_gain(config.vga_gain_db());
+        let tx_vga = self.set_tx_vga_gain(config.tx_vga_gain_db());
         let amp = self.set_amp(config.amp_enabled());
         let bias = self.set_bias_tee(config.bias_tee_enabled());
         rate.and_then(move |()| frequency)
             .and_then(move |()| lna)
             .and_then(move |()| vga)
+            .and_then(move |()| tx_vga)
             .and_then(move |()| amp)
             .and_then(move |()| bias)
     }
@@ -173,30 +214,10 @@ impl<C> HackRf<C>
 where
     C: ControlBackend + StreamingBackend,
 {
-    pub(crate) fn start_rx_blocking(&self, bias_tee: bool) -> Result<DirectRxStream<C::BulkIn>> {
+    pub(crate) fn start_rx_blocking(&self) -> Result<DirectRxStream<C::BulkIn>> {
         let bulk_in = self.control.as_ref().bulk_in(RX_ENDPOINT)?;
         let prepared = DirectRxStream::prepare(bulk_in);
-        self.set_transceiver_mode(TransceiverMode::Receive).wait()?;
-        if let Err(error) = self.set_bias_tee(bias_tee).wait() {
-            let _ = self.set_transceiver_mode(TransceiverMode::Off).wait();
-            return Err(error);
-        }
-        match prepared.start_blocking() {
-            Ok(stream) => Ok(stream),
-            Err(error) => {
-                let _ = self.set_transceiver_mode(TransceiverMode::Off).wait();
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) fn stop_rx_blocking(
-        &self,
-        mut stream: DirectRxStream<C::BulkIn>,
-    ) -> (StreamingStats, Result<()>) {
-        let stats = stream.close();
-        let result = self.set_transceiver_mode(TransceiverMode::Off).wait();
-        (stats, result)
+        prepared.start_blocking()
     }
 }
 
@@ -204,45 +225,18 @@ impl<C> HackRf<C>
 where
     C: ControlBackend + AsyncStreamingBackend,
 {
-    pub(crate) async fn start_rx_async(
-        &self,
-        bias_tee: bool,
-    ) -> Result<AsyncDirectRxStream<C::BulkIn>> {
+    pub(crate) async fn start_rx_async(&self) -> Result<AsyncDirectRxStream<C::BulkIn>> {
         let bulk_in = self.control.as_ref().bulk_in(RX_ENDPOINT)?;
         let prepared = AsyncDirectRxStream::prepare(bulk_in);
-        self.set_transceiver_mode(TransceiverMode::Receive).await?;
-        if let Err(error) = self.set_bias_tee(bias_tee).await {
-            let _ = self.set_transceiver_mode(TransceiverMode::Off).await;
-            return Err(error);
-        }
-        match prepared.start_async().await {
-            Ok(stream) => Ok(stream),
-            Err(error) => {
-                let _ = self.set_transceiver_mode(TransceiverMode::Off).await;
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) async fn restart_rx_async(&self, bias_tee: bool) -> Result<()> {
-        self.set_transceiver_mode(TransceiverMode::Receive).await?;
-        if let Err(error) = self.set_bias_tee(bias_tee).await {
-            let _ = self.set_transceiver_mode(TransceiverMode::Off).await;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn stop_rx_async(
-        &self,
-        stream: &mut AsyncDirectRxStream<C::BulkIn>,
-    ) -> Result<()> {
-        self.set_transceiver_mode(TransceiverMode::Off).await?;
-        stream.pause()
+        prepared.start_async().await
     }
 }
 
 impl HackRf<NusbControl> {
+    pub(crate) fn bulk_out(&self) -> Result<NusbBulkOut> {
+        self.control.bulk_out(TX_ENDPOINT)
+    }
+
     pub(crate) fn open(serial: Option<u128>) -> impl MaybeFuture<Output = Result<(Self, u16)>> {
         discovery::select_device(serial)
             .and_then(|info| {
@@ -305,7 +299,7 @@ pub(crate) fn shutdown_hardware<C: ControlBackend>(
     direct.set_transceiver_mode(TransceiverMode::Off)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::sync::Mutex;
 
@@ -325,7 +319,8 @@ mod tests {
             self.requests.lock().unwrap().push(request.clone());
             let data = match request.request {
                 crate::commands::VendorRequest::SetLnaGain
-                | crate::commands::VendorRequest::SetVgaGain => vec![1],
+                | crate::commands::VendorRequest::SetVgaGain
+                | crate::commands::VendorRequest::SetTxVgaGain => vec![1],
                 _ => vec![0; request.length],
             };
             crate::maybe_future::ready(Ok(data))

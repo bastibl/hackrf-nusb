@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use nusb::transfer::{
-    Buffer as NusbBuffer, Bulk, ControlIn, ControlOut, ControlType, In, Recipient,
+    Buffer as NusbBuffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient,
 };
 use nusb::{Endpoint, MaybeFuture};
 
@@ -112,6 +112,10 @@ impl VendorControlRequest {
         Self::in_request(VendorRequest::SetVgaGain, 0, gain_db as u16, 1)
     }
 
+    pub(crate) fn set_tx_vga_gain(gain_db: u8) -> Self {
+        Self::in_request(VendorRequest::SetTxVgaGain, 0, gain_db as u16, 1)
+    }
+
     pub(crate) fn set_amp(enabled: bool) -> Self {
         Self::out_request(VendorRequest::AmpEnable, enabled.into(), 0, Vec::new())
     }
@@ -130,6 +134,10 @@ impl VendorControlRequest {
 
     pub(crate) fn part_id_serial_read() -> Self {
         Self::in_request(VendorRequest::BoardPartIdSerialNoRead, 0, 0, 24)
+    }
+
+    pub(crate) fn get_buffer_size() -> Self {
+        Self::in_request(VendorRequest::GetBufferSize, 0, 0, 4)
     }
 
     fn nusb_control_in(&self) -> Result<ControlIn> {
@@ -183,12 +191,60 @@ pub(crate) struct NusbBulkIn {
     endpoint: Endpoint<Bulk, In>,
 }
 
+#[derive(Debug)]
+pub(crate) struct NusbBulkOut {
+    endpoint: Endpoint<Bulk, Out>,
+}
+
 impl NusbControl {
     pub(crate) fn new(device: nusb::Device, interface: nusb::Interface) -> Self {
         Self {
             _device: device,
             interface,
         }
+    }
+
+    pub(crate) fn bulk_out(&self, endpoint: u8) -> Result<NusbBulkOut> {
+        Ok(NusbBulkOut {
+            endpoint: self
+                .interface
+                .endpoint::<Bulk, Out>(endpoint)
+                .map_err(Error::from)?,
+        })
+    }
+}
+
+impl NusbBulkOut {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn clear_halt_blocking(&mut self) -> Result<()> {
+        self.endpoint.clear_halt().wait().map_err(Error::from)
+    }
+
+    pub(crate) async fn clear_halt_async(&mut self) -> Result<()> {
+        self.endpoint.clear_halt().await.map_err(Error::from)
+    }
+
+    pub(crate) fn submit(&mut self, bytes: Vec<u8>) {
+        self.endpoint.submit(bytes.into());
+    }
+
+    pub(crate) fn pending(&self) -> usize {
+        self.endpoint.pending()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn wait_next_complete(&mut self, timeout: Duration) -> Option<Result<()>> {
+        self.endpoint
+            .wait_next_complete(timeout)
+            .map(|completion| completion.status.map_err(Error::from))
+    }
+
+    pub(crate) async fn next_complete(&mut self) -> Result<()> {
+        self.endpoint
+            .next_complete()
+            .await
+            .status
+            .map_err(Error::from)
     }
 }
 
@@ -375,6 +431,18 @@ mod tests {
         let request = VendorControlRequest::set_baseband_bandwidth(20_000_000);
         assert_eq!(request.value, 20_000_000_u32 as u16);
         assert_eq!(request.index, (20_000_000_u32 >> 16) as u16);
+    }
+
+    #[test]
+    fn tx_gain_and_flush_size_requests_match_libhackrf() {
+        let gain = VendorControlRequest::set_tx_vga_gain(47);
+        assert_eq!(gain.request, VendorRequest::SetTxVgaGain);
+        assert_eq!(gain.index, 47);
+        assert_eq!(gain.length, 1);
+
+        let flush = VendorControlRequest::get_buffer_size();
+        assert_eq!(flush.request, VendorRequest::GetBufferSize);
+        assert_eq!(flush.length, 4);
     }
 
     #[test]
