@@ -49,7 +49,7 @@ fn main() -> hackrf_nusb::Result<()> {
 
     let mut samples = [Complex32::default(); 4096];
     let count = rx.read(&mut samples, Some(Duration::from_secs(1))).wait()?;
-    let stats = rx.stop().wait()?;
+    let stats = rx.close().wait()?;
     println!("received {count} samples; {stats:?}");
 
     device.shutdown().wait()?;
@@ -80,23 +80,40 @@ turns the radio off automatically but permanently invalidates that stream;
 on native targets, drop it and create a fresh stream from the same device. On
 WebUSB, drop and reopen the device before replacing a failed RX stream because
 the browser cannot cancel its pending RX transfers. If that automatic stop
-fails, retry `stop` before replacing the stream. Shutdown is terminal for a
-device handle: if its hardware request fails or is cancelled, the handle
-remains closed. Drop it and reopen the device to try again. Dropping a device
-or stream attempts cleanup but cannot report its result and is not a lifecycle
-guarantee.
+fails, close the stream to attempt final cleanup.
+
+`rx.close()` and `tx.close()` consume the stream immediately and return lazy,
+owned operations. Wait or await close to observe the current or most recently
+completed run's statistics and release the stream claim. RX close retires its
+queue before turning RX off; TX close flushes and drains accepted samples
+before turning TX off. A never-started stream returns zero counters.
+Dropping an unpolled close operation, cancellation, and errors trigger
+best-effort cleanup; the consumed stream is not returned for retry.
+
+Close every claimed stream before `device.shutdown()`, including dormant and
+stopped streams. Otherwise shutdown returns `Busy` and leaves the device usable.
+Shutdown is lazy and terminal once execution begins; failures and cancellation
+can be retried, and repeated successful shutdown sends no commands.
+
+Streams share device ownership and remain usable after the device handle is
+dropped. The final shared owner attempts hardware cleanup. Native drop cleans
+up synchronously; WebUSB cleanup runs in the background and retains the stream
+claim until its attempt finishes. Failed cleanup blocks unsafe replacement and
+starts; once claims are released, explicit shutdown can recover the hardware.
+Drop cleanup cannot report its result.
 
 ## Execution and performance
 
 Streaming and one-shot operations implement `nusb::MaybeFuture`. On native
 targets, call `.wait()` for blocking operation or `.await` the same value in
 async code. WebUSB supports only the async form. Do not mix execution styles
-for one device session.
+for one device session, except consuming close, which supports either style
+on native targets.
 
 The RX stream owns endpoint `0x81` and its persistent queue of 16 × 256 KiB
 transfers. A successful RX `stop` turns the radio off but retains that queue;
-the next `start` resumes it without submitting a second queue. Drop the RX
-stream for final best-effort queue cleanup. An active TX stream owns endpoint
+the next `start` resumes it without submitting a second queue. Close the RX
+stream for final queue cleanup and claim release. An active TX stream owns endpoint
 `0x02` and its outstanding transfers. TX writes use a 16-transfer backpressure
 window; `stop` may queue one additional terminal flush before draining, to
 preserve the end-of-burst boundary. Steady-state `RxStream::read` and
@@ -121,7 +138,7 @@ This repository's `.cargo/config.toml` contains the required setting. RX
 `stop`/`start` retains and resumes the existing queue, which avoids trying to
 cancel WebUSB bulk-IN transfers or create a second queue during a TX handoff.
 Samples already buffered before `stop` may be returned after `start`.
-Dropping an RX stream after it has started permanently reserves its browser
+Closing or dropping an RX stream after it has started permanently reserves its browser
 queue for the device session; reopen the device before creating a replacement
 RX stream.
 

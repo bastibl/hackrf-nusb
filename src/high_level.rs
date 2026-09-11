@@ -33,8 +33,6 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 struct DeviceInner {
     direct: HackRf<NusbControl>,
     info: DeviceInfo,
-    #[cfg(not(target_arch = "wasm32"))]
-    shutdown_on_drop: bool,
 }
 
 /// Ensures a partially initialized device is returned to off mode.
@@ -79,23 +77,15 @@ impl Drop for OpeningCleanup {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for DeviceInner {
-    fn drop(&mut self) {
-        if self.shutdown_on_drop {
-            let _ = shutdown_hardware(&self.direct).wait();
-        }
-    }
-}
-
 /// High-level owned HackRF device handle.
+///
+/// Streams share the hardware lifetime and remain usable after this handle
+/// is dropped. Close all streams before explicitly shutting down the device.
 #[derive(Debug)]
 pub struct Device {
     inner: DeviceInner,
     config: Config,
     radio: std::sync::Arc<LifecycleController>,
-    #[cfg(target_arch = "wasm32")]
-    shutdown_complete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -396,11 +386,12 @@ impl Device {
 
     /// Put the transceiver in off mode and close the logical device session.
     ///
-    /// Returns [`Error::Busy`] unless both directions have been stopped. Once
-    /// shutdown starts, streams can no longer be started. The session remains
-    /// closed if the hardware request fails or its future is cancelled; drop
-    /// this handle and reopen the device to try again. Dropping the handle
-    /// performs best-effort cleanup on supported targets.
+    /// Returns [`Error::Busy`] while any stream claim or configuration
+    /// operation is held, including stopped streams and pending close cleanup.
+    /// Close every stream before shutdown. Rejection leaves the device usable.
+    /// Once execution begins, the session is terminal, but failed or cancelled
+    /// shutdown can be retried. Successful repeated shutdown sends no commands.
+    /// The final shared owner performs best-effort cleanup on drop.
     #[must_use = "shutdown must be waited or awaited to observe hardware cleanup"]
     pub fn shutdown(&mut self) -> impl MaybeFuture<Output = Result<()>> + '_ {
         DeviceShutdownOperation { device: self }
@@ -408,40 +399,11 @@ impl Device {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn shutdown_blocking(&mut self) -> Result<()> {
-        self.radio.shutdown_blocking()?;
-        self.inner.shutdown_on_drop = false;
-        Ok(())
+        self.radio.shutdown_blocking()
     }
 
     async fn shutdown_async(&mut self) -> Result<()> {
-        self.radio.shutdown_async().await?;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.inner.shutdown_on_drop = false;
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.shutdown_complete = true;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Device {
-    fn drop(&mut self) {
-        self.radio.close_on_drop();
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Device drop is deliberately best effort. Streams surviving it
-            // are unsupported and no cleanup outcome is observable.
-        }
-        #[cfg(target_arch = "wasm32")]
-        if !self.shutdown_complete {
-            let direct = self.inner.direct.stream_handle();
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = shutdown_hardware(&direct).await;
-            });
-        }
+        self.radio.shutdown_async().await
     }
 }
 
@@ -522,8 +484,6 @@ impl DeviceBuilder {
                                 inner: DeviceInner {
                                     direct: direct.stream_handle(),
                                     info,
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    shutdown_on_drop: true,
                                 },
                                 radio: LifecycleController::new(
                                     direct,
@@ -532,8 +492,6 @@ impl DeviceBuilder {
                                     config.bias_tee_enabled(),
                                 ),
                                 config,
-                                #[cfg(target_arch = "wasm32")]
-                                shutdown_complete: false,
                             })
                         })
                 })
@@ -758,10 +716,28 @@ pub struct RxStream {
     failed: bool,
     #[cfg(target_arch = "wasm32")]
     queue_started: bool,
-    _claim: StreamClaim,
+    claim: Option<StreamClaim>,
+    cleanup_armed: bool,
 }
 
 impl RxStream {
+    /// Consume this stream, clean up its transfers, and release its claim.
+    ///
+    /// Returns the current or most recently completed run's counters. The
+    /// operation is lazy and owns the stream; cancellation or failure invokes
+    /// best-effort cleanup. Native close supports either execution style.
+    ///
+    /// ```compile_fail
+    /// use hackrf_nusb::{RxStream, MaybeFuture};
+    /// async fn consumed(stream: RxStream) {
+    ///     let _ = stream.close().await;
+    ///     let _ = stream.close().await;
+    /// }
+    /// ```
+    pub fn close(self) -> impl MaybeFuture<Output = Result<StreamingStats>> + 'static {
+        RxCloseOperation { stream: self }
+    }
+
     fn new(
         direct: HackRf<NusbControl>,
         radio: std::sync::Arc<LifecycleController>,
@@ -773,7 +749,8 @@ impl RxStream {
             failed: false,
             #[cfg(target_arch = "wasm32")]
             queue_started: false,
-            _claim: claim,
+            claim: Some(claim),
+            cleanup_armed: true,
         }
     }
 
@@ -806,8 +783,8 @@ impl RxStream {
     /// Stop RX, turn the radio off, and return counters for this run.
     ///
     /// A successful stop retains the RX queue so a later [`Self::start`] can
-    /// resume it without submitting a second queue. Drop the stream for final
-    /// best-effort queue cleanup. A stream I/O failure turns the radio off,
+    /// resume it without submitting a second queue. Use [`Self::close`] for
+    /// final queue cleanup and claim release. A stream I/O failure turns the radio off,
     /// closes the queue, and permanently invalidates this stream; drop it and
     /// create a new RX stream before starting again. On WebUSB, dropping an
     /// RX stream whose queue has started is terminal for RX on this device
@@ -1033,37 +1010,66 @@ impl RxStream {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn close_queue_on_drop(&mut self) {
+    fn close_queue(&mut self) -> StreamingStats {
+        #[cfg(target_arch = "wasm32")]
+        self.abandon_webusb_queue();
         match &mut self.state {
-            RxStreamState::Dormant(_) | RxStreamState::Poisoned => {}
-            RxStreamState::Blocking(stream) => {
-                stream.close_queue();
+            RxStreamState::Dormant(_) | RxStreamState::Poisoned => StreamingStats::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            RxStreamState::Blocking(stream) => stream.close_queue(),
+            RxStreamState::Async(stream) => stream.close_queue(),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn close_blocking(&mut self) -> Result<StreamingStats> {
+        let transition = self.radio.begin_close(Direction::Rx)?;
+        let stats = self.close_queue();
+        if let Some(mut transition) = transition {
+            transition.finish_blocking()?;
+        }
+        self.cleanup_armed = false;
+        Ok(stats)
+    }
+
+    async fn close_async(&mut self) -> Result<StreamingStats> {
+        let transition = self.radio.begin_close(Direction::Rx)?;
+        let stats = self.close_queue();
+        if let Some(mut transition) = transition {
+            transition.finish_async().await?;
+        }
+        self.cleanup_armed = false;
+        Ok(stats)
+    }
+    // Move the claim with the cleanup attempt so shutdown cannot race the
+    // browser's outstanding off request.
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn background_cleanup(&mut self) -> impl Future<Output = ()> + 'static {
+        self.close_queue();
+        self.cleanup_armed = false;
+        let radio = std::sync::Arc::clone(&self.radio);
+        let claim = self.claim.take();
+        async move {
+            if let Ok(Some(mut transition)) = radio.begin_close(Direction::Rx) {
+                let _ = transition.finish_async().await;
             }
-            RxStreamState::Async(stream) => {
-                stream.close_queue();
-            }
+            drop(claim);
         }
     }
 }
 
 impl Drop for RxStream {
     fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        self.radio.mark_stream_failed(Direction::Rx);
         #[cfg(not(target_arch = "wasm32"))]
-        if let Ok(Some(mut transition)) = self.radio.begin_stop_on_drop_blocking(Direction::Rx) {
-            self.close_queue_on_drop();
-            let _ = transition.finish_blocking();
+        {
+            let _ = self.close_blocking();
         }
         #[cfg(target_arch = "wasm32")]
-        {
-            self.abandon_webusb_queue();
-            let radio = std::sync::Arc::clone(&self.radio);
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Ok(Some(mut transition)) = radio.begin_stop_async(Direction::Rx).await {
-                    let _ = transition.finish_async().await;
-                }
-            });
-        }
+        wasm_bindgen_futures::spawn_local(self.background_cleanup());
     }
 }
 
@@ -1075,10 +1081,12 @@ impl Drop for RxStream {
 pub struct TxStream {
     radio: std::sync::Arc<LifecycleController>,
     transport: Option<TxTransport>,
+    stats: TxStreamingStats,
     style: Option<ExecutionStyle>,
     state: TxStreamState,
     failed: bool,
-    _claim: StreamClaim,
+    claim: Option<StreamClaim>,
+    cleanup_armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1089,14 +1097,33 @@ enum TxStreamState {
 }
 
 impl TxStream {
+    /// Consume this stream, clean up its transfers, and release its claim.
+    ///
+    /// Returns the current or most recently completed run's counters. The
+    /// operation is lazy and owns the stream; cancellation or failure invokes
+    /// best-effort cleanup. Native close supports either execution style.
+    ///
+    /// ```compile_fail
+    /// use hackrf_nusb::{TxStream, MaybeFuture};
+    /// async fn consumed(stream: TxStream) {
+    ///     let _ = stream.close().await;
+    ///     let _ = stream.close().await;
+    /// }
+    /// ```
+    pub fn close(self) -> impl MaybeFuture<Output = Result<TxStreamingStats>> + 'static {
+        TxCloseOperation { stream: self }
+    }
+
     fn new(radio: std::sync::Arc<LifecycleController>, claim: StreamClaim) -> Self {
         Self {
             radio,
             transport: None,
+            stats: TxStreamingStats::default(),
             style: None,
             state: TxStreamState::Dormant,
             failed: false,
-            _claim: claim,
+            claim: Some(claim),
+            cleanup_armed: true,
         }
     }
 
@@ -1244,20 +1271,35 @@ impl TxStream {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn stop_blocking(&mut self) -> Result<TxStreamingStats> {
-        let transition = self.radio.begin_stop_blocking(Direction::Tx)?;
-        self.state = TxStreamState::Recovery;
-        let (stats, drain_error) = if let Some(transport) = self.transport.as_mut() {
-            match transport.flush_and_drain_blocking() {
-                Ok(()) => (transport.stats(), None),
-                Err(error) => {
-                    self.failed = true;
-                    transport.mark_unusable();
-                    (transport.stats(), Some(error))
-                }
-            }
+        self.finish_blocking(false)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_blocking(&mut self, closing: bool) -> Result<TxStreamingStats> {
+        let transition = if closing {
+            self.radio.begin_close(Direction::Tx)?
         } else {
-            (TxStreamingStats::default(), None)
+            self.radio.begin_stop_blocking(Direction::Tx)?
         };
+        self.state = TxStreamState::Recovery;
+        let (stats, drain_error) =
+            if let Some(transport) = self.transport.as_mut().filter(|t| t.is_reusable()) {
+                match transport.flush_and_drain_blocking() {
+                    Ok(()) => (transport.stats(), None),
+                    Err(error) => {
+                        self.failed = true;
+                        transport.mark_unusable();
+                        (transport.stats(), Some(error))
+                    }
+                }
+            } else {
+                (
+                    self.transport
+                        .as_ref()
+                        .map_or(self.stats, TxTransport::stats),
+                    None,
+                )
+            };
         if let Some(mut transition) = transition
             && let Err(error) = transition.finish_blocking()
         {
@@ -1267,6 +1309,7 @@ impl TxStream {
                 None => error,
             });
         }
+        self.stats = stats;
         if let Some(transport) = self.transport.take()
             && transport.is_reusable()
         {
@@ -1277,20 +1320,34 @@ impl TxStream {
     }
 
     async fn stop_async(&mut self) -> Result<TxStreamingStats> {
-        let transition = self.radio.begin_stop_async(Direction::Tx).await?;
-        self.state = TxStreamState::Recovery;
-        let (stats, drain_error) = if let Some(transport) = self.transport.as_mut() {
-            match transport.flush_and_drain_async().await {
-                Ok(()) => (transport.stats(), None),
-                Err(error) => {
-                    self.failed = true;
-                    transport.mark_unusable();
-                    (transport.stats(), Some(error))
-                }
-            }
+        self.finish_async(false).await
+    }
+
+    async fn finish_async(&mut self, closing: bool) -> Result<TxStreamingStats> {
+        let transition = if closing {
+            self.radio.begin_close(Direction::Tx)?
         } else {
-            (TxStreamingStats::default(), None)
+            self.radio.begin_stop_async(Direction::Tx).await?
         };
+        self.state = TxStreamState::Recovery;
+        let (stats, drain_error) =
+            if let Some(transport) = self.transport.as_mut().filter(|t| t.is_reusable()) {
+                match transport.flush_and_drain_async().await {
+                    Ok(()) => (transport.stats(), None),
+                    Err(error) => {
+                        self.failed = true;
+                        transport.mark_unusable();
+                        (transport.stats(), Some(error))
+                    }
+                }
+            } else {
+                (
+                    self.transport
+                        .as_ref()
+                        .map_or(self.stats, TxTransport::stats),
+                    None,
+                )
+            };
         if let Some(mut transition) = transition
             && let Err(error) = transition.finish_async().await
         {
@@ -1300,6 +1357,7 @@ impl TxStream {
                 None => error,
             });
         }
+        self.stats = stats;
         if let Some(transport) = self.transport.take()
             && transport.is_reusable()
         {
@@ -1308,51 +1366,37 @@ impl TxStream {
         self.state = TxStreamState::Dormant;
         drain_error.map_or(Ok(stats), Err)
     }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn stop_on_drop_blocking(&mut self) {
-        let Ok(Some(mut transition)) = self.radio.begin_stop_on_drop_blocking(Direction::Tx) else {
-            return;
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn background_cleanup(&mut self) -> impl Future<Output = ()> + 'static {
+        self.cleanup_armed = false;
+        let mut cleanup = Self {
+            radio: std::sync::Arc::clone(&self.radio),
+            transport: self.transport.take(),
+            stats: self.stats,
+            style: self.style,
+            state: self.state,
+            failed: self.failed,
+            claim: self.claim.take(),
+            cleanup_armed: false,
         };
-        let drain_succeeded = self
-            .transport
-            .as_mut()
-            .map(|transport| transport.flush_and_drain_blocking().is_ok())
-            .unwrap_or(true);
-        if transition.finish_blocking().is_ok()
-            && drain_succeeded
-            && let Some(transport) = self.transport.take()
-            && transport.is_reusable()
-        {
-            self.radio.return_tx_transport(transport);
+        async move {
+            let _ = cleanup.finish_async(true).await;
         }
     }
 }
 
 impl Drop for TxStream {
     fn drop(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.stop_on_drop_blocking();
-        #[cfg(target_arch = "wasm32")]
-        {
-            let radio = std::sync::Arc::clone(&self.radio);
-            let mut transport = self.transport.take();
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Ok(Some(mut transition)) = radio.begin_stop_async(Direction::Tx).await {
-                    let drain_succeeded = match transport.as_mut() {
-                        Some(transport) => transport.flush_and_drain_async().await.is_ok(),
-                        None => true,
-                    };
-                    if transition.finish_async().await.is_ok()
-                        && drain_succeeded
-                        && let Some(transport) = transport.take()
-                        && transport.is_reusable()
-                    {
-                        radio.return_tx_transport(transport);
-                    }
-                }
-            });
+        if !self.cleanup_armed {
+            return;
         }
+        self.radio.mark_stream_failed(Direction::Tx);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.finish_blocking(true);
+        }
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(self.background_cleanup());
     }
 }
 
@@ -1505,5 +1549,460 @@ impl MaybeFuture for DeviceShutdownOperation<'_> {
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(self) -> Self::Output {
         self.device.shutdown_blocking()
+    }
+}
+
+struct RxCloseOperation {
+    stream: RxStream,
+}
+
+impl IntoFuture for RxCloseOperation {
+    type Output = Result<StreamingStats>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(mut self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let stats = self.stream.close_async().await?;
+            self.stream.cleanup_armed = false;
+            self.stream.claim.take();
+            drop(self);
+            Ok(stats)
+        })
+    }
+}
+
+impl MaybeFuture for RxCloseOperation {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(mut self) -> Self::Output {
+        let stats = self.stream.close_blocking()?;
+        self.stream.cleanup_armed = false;
+        self.stream.claim.take();
+        drop(self);
+        Ok(stats)
+    }
+}
+
+struct TxCloseOperation {
+    stream: TxStream,
+}
+
+impl IntoFuture for TxCloseOperation {
+    type Output = Result<TxStreamingStats>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(mut self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let stats = self.stream.finish_async(true).await?;
+            self.stream.cleanup_armed = false;
+            self.stream.claim.take();
+            drop(self);
+            Ok(stats)
+        })
+    }
+}
+
+impl MaybeFuture for TxCloseOperation {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(mut self) -> Self::Output {
+        let stats = self.stream.finish_blocking(true)?;
+        self.stream.cleanup_armed = false;
+        self.stream.claim.take();
+        drop(self);
+        Ok(stats)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lifecycle_tests {
+    use super::*;
+    use crate::usb::TestIo;
+    use futures_lite::future::{block_on, poll_once};
+    use std::sync::{Arc, Mutex};
+
+    fn device() -> (Device, Arc<Mutex<TestIo>>) {
+        let (control, endpoint, io) = TestIo::backends();
+        let direct = HackRf::from_control(control);
+        let radio = LifecycleController::new(direct.stream_handle(), endpoint, 512, false);
+        (
+            Device {
+                inner: DeviceInner {
+                    direct,
+                    info: DeviceInfo {
+                        board_id: crate::BoardId::HackRfOne,
+                        firmware_version: String::new(),
+                        usb_api_version: 0,
+                        serial: None,
+                    },
+                },
+                config: Config::default(),
+                radio,
+            },
+            io,
+        )
+    }
+
+    fn run<O: MaybeFuture>(operation: O, asynchronous: bool) -> O::Output {
+        if asynchronous {
+            block_on(operation.into_future())
+        } else {
+            operation.wait()
+        }
+    }
+
+    #[test]
+    fn close_matrix_retains_per_run_stats_and_releases_all_owners() {
+        for asynchronous in [false, true] {
+            for close_async in [false, true] {
+                for stopped in [false, true] {
+                    let (mut device, io) = device();
+                    let mut rx = device.rx_stream().unwrap();
+                    let mut tx = device.tx_stream().unwrap();
+                    run(rx.start(), asynchronous).unwrap();
+                    let mut samples = [Complex32::default(); 64];
+                    run(
+                        rx.read(&mut samples, Some(Duration::from_secs(1))),
+                        asynchronous,
+                    )
+                    .unwrap();
+                    let rx_stats = run(rx.stop(), asynchronous).unwrap();
+                    run(tx.start(), asynchronous).unwrap();
+                    run(tx.write(&samples, None, false), asynchronous).unwrap();
+                    let tx_stats = if stopped {
+                        Some(run(tx.stop(), asynchronous).unwrap())
+                    } else {
+                        None
+                    };
+                    assert!(matches!(device.shutdown().wait(), Err(Error::Busy)));
+                    let before = io.lock().unwrap().events.len();
+                    let operation = rx.close();
+                    assert_eq!(io.lock().unwrap().events.len(), before);
+                    assert_eq!(run(operation, close_async).unwrap(), rx_stats);
+                    let stats = run(tx.close(), close_async).unwrap();
+                    assert_eq!(stats.samples_accepted, 64);
+                    assert_eq!(stats.flush_buffers, 1);
+                    assert_eq!(stats.buffers_completed, 2);
+                    if let Some(previous) = tx_stats {
+                        assert_eq!(stats, previous);
+                    }
+                    assert_eq!(Arc::strong_count(&device.radio), 1);
+                    device.shutdown().wait().unwrap();
+                    let before = io.lock().unwrap().events.len();
+                    device.shutdown().wait().unwrap();
+                    drop(device);
+                    assert_eq!(io.lock().unwrap().events.len(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rx_active_close_retires_before_off_and_supports_replacement() {
+        for asynchronous in [false, true] {
+            let (mut device, io) = device();
+            let mut rx = device.rx_stream().unwrap();
+            run(rx.start(), asynchronous).unwrap();
+            io.lock().unwrap().events.clear();
+            run(rx.close(), !asynchronous).unwrap();
+            assert_eq!(io.lock().unwrap().events, ["rx:retire", "control:0"]);
+            let mut tx = device.tx_stream().unwrap();
+            run(tx.start(), asynchronous).unwrap();
+            run(tx.stop(), asynchronous).unwrap();
+            let mut rx = device.rx_stream().unwrap();
+            run(rx.start(), asynchronous).unwrap();
+            let before = io.lock().unwrap().events.len();
+            run(tx.close(), !asynchronous).unwrap();
+            assert_eq!(io.lock().unwrap().events.len(), before);
+            run(rx.close(), !asynchronous).unwrap();
+            device.shutdown().wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn dormant_and_unpolled_close_hold_claims_without_io() {
+        let (mut device, io) = device();
+        let rx = device.rx_stream().unwrap();
+        let tx = device.tx_stream().unwrap();
+        let rx_close = rx.close();
+        let tx_close = tx.close().into_future();
+        assert!(io.lock().unwrap().events.is_empty());
+        assert!(matches!(device.shutdown().wait(), Err(Error::Busy)));
+        assert!(matches!(device.rx_stream(), Err(Error::Busy)));
+        drop(rx_close);
+        drop(tx_close);
+        assert!(io.lock().unwrap().events.is_empty());
+        assert_eq!(
+            device.rx_stream().unwrap().close().wait().unwrap(),
+            StreamingStats::default()
+        );
+        assert_eq!(
+            device.tx_stream().unwrap().close().wait().unwrap(),
+            TxStreamingStats::default()
+        );
+        device.shutdown().wait().unwrap();
+    }
+
+    #[test]
+    fn cancelled_close_restores_transition_before_fallback() {
+        for rx_direction in [false, true] {
+            for during_off in [false, true] {
+                if rx_direction && !during_off {
+                    continue;
+                }
+                let (mut device, io) = device();
+                let operation: BoxFuture<'static, Result<()>> = if rx_direction {
+                    let mut rx = device.rx_stream().unwrap();
+                    block_on(rx.start().into_future()).unwrap();
+                    Box::pin(async move { rx.close().await.map(|_| ()) })
+                } else {
+                    let mut tx = device.tx_stream().unwrap();
+                    block_on(tx.start().into_future()).unwrap();
+                    block_on(
+                        tx.write(&[Complex32::default(); 1], None, false)
+                            .into_future(),
+                    )
+                    .unwrap();
+                    Box::pin(async move { tx.close().await.map(|_| ()) })
+                };
+                {
+                    let mut io = io.lock().unwrap();
+                    io.pause_off = during_off;
+                    io.pause_drain = !during_off;
+                }
+                let mut operation = operation;
+                assert!(block_on(poll_once(operation.as_mut())).is_none());
+                assert!(matches!(device.shutdown().wait(), Err(Error::Busy)));
+                drop(operation);
+                assert_eq!(Arc::strong_count(&device.radio), 1);
+                device.rx_stream().unwrap().close().wait().unwrap();
+                device.tx_stream().unwrap().close().wait().unwrap();
+                device.shutdown().wait().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn drain_failure_attempts_off_and_never_redrains_or_reuses_transport() {
+        for asynchronous in [false, true] {
+            let (mut device, io) = device();
+            let mut tx = device.tx_stream().unwrap();
+            run(tx.start(), asynchronous).unwrap();
+            run(
+                tx.write(&[Complex32::default(); 1], None, false),
+                asynchronous,
+            )
+            .unwrap();
+            {
+                let mut io = io.lock().unwrap();
+                io.events.clear();
+                io.fail_drain = true;
+                io.fail_off = true;
+            }
+            assert!(run(tx.close(), asynchronous).is_err());
+            assert_eq!(
+                io.lock().unwrap().events,
+                ["submit:512", "complete", "control:0", "control:0"]
+            );
+            assert!(matches!(device.tx_stream(), Err(Error::Busy)));
+            io.lock().unwrap().fail_off = false;
+            device.shutdown().wait().unwrap();
+        }
+        let (device, io) = device();
+        let mut tx = device.tx_stream().unwrap();
+        tx.start().wait().unwrap();
+        tx.write(&[Complex32::default(); 1], None, false)
+            .wait()
+            .unwrap();
+        io.lock().unwrap().fail_drain = true;
+        assert!(tx.close().wait().is_err());
+        assert!(device.tx_stream().unwrap().start().wait().is_err());
+    }
+
+    #[test]
+    fn failure_cleanup_releases_claim_and_shutdown_recovers() {
+        for asynchronous in [false, true] {
+            let (mut device, io) = device();
+            let mut rx = device.rx_stream().unwrap();
+            run(rx.start(), asynchronous).unwrap();
+            io.lock().unwrap().fail_rx = true;
+            assert!(
+                run(
+                    rx.read(&mut [Complex32::default(); 1], Some(Duration::from_secs(1))),
+                    asynchronous
+                )
+                .is_err()
+            );
+            run(rx.close(), !asynchronous).unwrap();
+            let mut rx = device.rx_stream().unwrap();
+            run(rx.start(), asynchronous).unwrap();
+            io.lock().unwrap().fail_off = true;
+            assert!(run(rx.close(), !asynchronous).is_err());
+            assert!(matches!(device.rx_stream(), Err(Error::Busy)));
+            assert!(device.shutdown().wait().is_err());
+            assert!(matches!(device.tx_stream(), Err(Error::DeviceClosed)));
+            io.lock().unwrap().fail_off = false;
+            device.shutdown().wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn shutdown_is_lazy_retryable_and_configuration_gated() {
+        let (mut device, io) = device();
+        drop(device.shutdown().into_future());
+        assert!(io.lock().unwrap().events.is_empty());
+        let guard = device
+            .radio
+            .begin_reconfigure(ExecutionStyle::Async)
+            .unwrap();
+        assert!(matches!(device.shutdown().wait(), Err(Error::Busy)));
+        drop(guard);
+        io.lock().unwrap().pause_off = true;
+        let mut operation = Box::pin(device.shutdown().into_future());
+        assert!(block_on(poll_once(operation.as_mut())).is_none());
+        drop(operation);
+        assert!(matches!(device.rx_stream(), Err(Error::DeviceClosed)));
+        io.lock().unwrap().pause_off = false;
+        device.shutdown().wait().unwrap();
+    }
+
+    #[test]
+    fn device_drop_preserves_streams_and_final_owner_cleans_up() {
+        for asynchronous in [false, true] {
+            let (device, io) = device();
+            let mut rx = device.rx_stream().unwrap();
+            let mut tx = device.tx_stream().unwrap();
+            drop(device);
+            assert!(io.lock().unwrap().events.is_empty());
+            run(rx.start(), asynchronous).unwrap();
+            run(rx.close(), !asynchronous).unwrap();
+            run(tx.start(), asynchronous).unwrap();
+            io.lock().unwrap().events.clear();
+            run(tx.close(), !asynchronous).unwrap();
+            assert_eq!(io.lock().unwrap().events, ["control:0", "control:0"]);
+        }
+    }
+
+    #[test]
+    fn full_tx_queue_flushes_before_drain_and_new_run_resets_stats() {
+        for asynchronous in [false, true] {
+            let (mut device, io) = device();
+            let mut tx = device.tx_stream().unwrap();
+            run(tx.start(), asynchronous).unwrap();
+            for _ in 0..crate::constants::TRANSFER_COUNT {
+                run(
+                    tx.write(&[Complex32::default(); 1], None, false),
+                    asynchronous,
+                )
+                .unwrap();
+            }
+            io.lock().unwrap().events.clear();
+            let stats = run(tx.stop(), asynchronous).unwrap();
+            let events = io.lock().unwrap().events.clone();
+            assert_eq!(events.first().unwrap(), "submit:512");
+            assert_eq!(events.last().unwrap(), "control:0");
+            assert_eq!(
+                stats.buffers_completed,
+                crate::constants::TRANSFER_COUNT as u64 + 1
+            );
+            assert_eq!(stats.flush_buffers, 1);
+            run(tx.start(), asynchronous).unwrap();
+            assert_eq!(
+                run(tx.close(), !asynchronous).unwrap(),
+                TxStreamingStats::default()
+            );
+            device.shutdown().wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn active_unpolled_operations_are_lazy_and_drop_cleans_up() {
+        for asynchronous in [false, true] {
+            for convert in [false, true] {
+                let (mut device, io) = device();
+                let mut rx = device.rx_stream().unwrap();
+                run(rx.start(), asynchronous).unwrap();
+                io.lock().unwrap().events.clear();
+                let operation = rx.close();
+                assert!(io.lock().unwrap().events.is_empty());
+                if convert {
+                    let future = operation.into_future();
+                    assert!(io.lock().unwrap().events.is_empty());
+                    drop(future);
+                } else {
+                    drop(operation);
+                }
+                assert_eq!(io.lock().unwrap().events, ["rx:retire", "control:0"]);
+                let mut tx = device.tx_stream().unwrap();
+                run(tx.start(), asynchronous).unwrap();
+                run(
+                    tx.write(&[Complex32::default(); 1], None, false),
+                    asynchronous,
+                )
+                .unwrap();
+                io.lock().unwrap().events.clear();
+                let operation = tx.close();
+                assert!(io.lock().unwrap().events.is_empty());
+                if convert {
+                    let future = operation.into_future();
+                    assert!(io.lock().unwrap().events.is_empty());
+                    drop(future);
+                } else {
+                    drop(operation);
+                }
+                assert_eq!(
+                    io.lock().unwrap().events,
+                    ["submit:512", "complete", "complete", "control:0"]
+                );
+                device.shutdown().wait().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn background_cleanup_holds_claim_through_completion_or_failure() {
+        for rx_direction in [false, true] {
+            for fail_off in [false, true] {
+                let (mut device, io) = device();
+                let mut cleanup: BoxFuture<'static, ()> = if rx_direction {
+                    let mut rx = device.rx_stream().unwrap();
+                    block_on(rx.start().into_future()).unwrap();
+                    Box::pin(rx.background_cleanup())
+                } else {
+                    let mut tx = device.tx_stream().unwrap();
+                    block_on(tx.start().into_future()).unwrap();
+                    Box::pin(tx.background_cleanup())
+                };
+                assert!(matches!(device.shutdown().wait(), Err(Error::Busy)));
+                io.lock().unwrap().pause_off = true;
+                assert!(block_on(poll_once(cleanup.as_mut())).is_none());
+                assert!(matches!(device.shutdown().wait(), Err(Error::Busy)));
+                {
+                    let mut io = io.lock().unwrap();
+                    io.pause_off = false;
+                    io.fail_off = fail_off;
+                }
+                block_on(cleanup);
+                assert_eq!(Arc::strong_count(&device.radio), 1);
+                if fail_off {
+                    assert!(matches!(device.rx_stream(), Err(Error::Busy)));
+                } else {
+                    device.rx_stream().unwrap().close().wait().unwrap();
+                    device.tx_stream().unwrap().close().wait().unwrap();
+                }
+                io.lock().unwrap().fail_off = false;
+                device.shutdown().wait().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn close_operations_and_futures_are_send_static() {
+        fn check<T: Send + 'static>(_: &T) {}
+        let (device, _) = device();
+        let rx = device.rx_stream().unwrap().close();
+        let tx = device.tx_stream().unwrap().close();
+        check(&rx);
+        check(&tx);
+        check(&rx.into_future());
+        check(&tx.into_future());
     }
 }

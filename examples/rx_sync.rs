@@ -49,8 +49,7 @@ fn main() -> hackrf_nusb::Result<()> {
         let mut samples = [Complex32::default(); 4096];
         rx.start().wait()?;
         let count = rx.read(&mut samples, Some(Duration::from_secs(1))).wait()?;
-        let stats = rx.stop().wait()?;
-        drop(rx);
+        let stats = rx.close().wait()?;
         println!(
             "read {count} samples; first={:?}; {stats:?}",
             samples.first()

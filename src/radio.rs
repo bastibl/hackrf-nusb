@@ -35,6 +35,7 @@ impl Direction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeviceState {
     Open,
+    Closing,
     Closed,
 }
 
@@ -572,6 +573,12 @@ impl LifecycleController {
         if state.device != DeviceState::Open {
             return Err(Error::DeviceClosed);
         }
+        if matches!(
+            state.phase,
+            Phase::Recovery(_) | Phase::Stopping(_) | Phase::Starting(_)
+        ) {
+            return Err(Error::Busy);
+        }
         #[cfg(target_arch = "wasm32")]
         if direction == Direction::Rx && state.rx_queue_abandoned {
             return Err(Error::stream_closed(
@@ -657,32 +664,30 @@ impl LifecycleController {
         self: &Arc<Self>,
         direction: Direction,
     ) -> Result<Option<StopTransition>> {
-        self.begin_stop(direction, Some(ExecutionStyle::Blocking), false)
+        self.begin_stop(direction, Some(ExecutionStyle::Blocking))
     }
 
     pub(crate) async fn begin_stop_async(
         self: &Arc<Self>,
         direction: Direction,
     ) -> Result<Option<StopTransition>> {
-        self.begin_stop(direction, Some(ExecutionStyle::Async), false)
+        self.begin_stop(direction, Some(ExecutionStyle::Async))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn begin_stop_on_drop_blocking(
+    pub(crate) fn begin_close(
         self: &Arc<Self>,
         direction: Direction,
     ) -> Result<Option<StopTransition>> {
-        self.begin_stop(direction, None, true)
+        self.begin_stop(direction, None)
     }
 
     fn begin_stop(
         self: &Arc<Self>,
         direction: Direction,
         style: Option<ExecutionStyle>,
-        allow_closed_device: bool,
     ) -> Result<Option<StopTransition>> {
         let mut state = lock(&self.state);
-        if !allow_closed_device && state.device != DeviceState::Open {
+        if state.device != DeviceState::Open {
             return Err(Error::DeviceClosed);
         }
         if let Some(style) = style {
@@ -693,6 +698,8 @@ impl LifecycleController {
         }
         match state.phase {
             Phase::Off => Ok(None),
+            Phase::Active(active) if active != direction && style.is_none() => Ok(None),
+            Phase::Active(_) | Phase::Recovery(_) if state.control_in_progress => Err(Error::Busy),
             Phase::Active(active) if active == direction => {
                 state.phase = Phase::Stopping(direction);
                 Ok(Some(StopTransition {
@@ -751,31 +758,31 @@ impl LifecycleController {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn shutdown_blocking(&self) -> Result<()> {
-        self.begin_device_shutdown()?;
-        self.direct
-            .set_transceiver_mode(TransceiverMode::Off)
-            .wait()
-    }
-
-    pub(crate) async fn shutdown_async(&self) -> Result<()> {
-        self.begin_device_shutdown()?;
-        self.direct.set_transceiver_mode(TransceiverMode::Off).await
-    }
-
-    fn begin_device_shutdown(&self) -> Result<()> {
-        let mut state = lock(&self.state);
-        if state.device == DeviceState::Closed {
-            return Ok(());
+        if self.begin_device_shutdown()? {
+            crate::device::shutdown_hardware(&self.direct).wait()?;
+            lock(&self.state).device = DeviceState::Closed;
         }
-        if state.control_in_progress || state.phase != Phase::Off {
-            return Err(Error::Busy);
-        }
-        state.device = DeviceState::Closed;
         Ok(())
     }
 
-    pub(crate) fn close_on_drop(&self) {
-        lock(&self.state).device = DeviceState::Closed;
+    pub(crate) async fn shutdown_async(&self) -> Result<()> {
+        if self.begin_device_shutdown()? {
+            crate::device::shutdown_hardware(&self.direct).await?;
+            lock(&self.state).device = DeviceState::Closed;
+        }
+        Ok(())
+    }
+
+    fn begin_device_shutdown(&self) -> Result<bool> {
+        let mut state = lock(&self.state);
+        if state.device == DeviceState::Closed {
+            return Ok(false);
+        }
+        if state.control_in_progress || state.rx_stream_claimed || state.tx_stream_claimed {
+            return Err(Error::Busy);
+        }
+        state.device = DeviceState::Closing;
+        Ok(true)
     }
 
     fn put_transport(&self, transport: TxTransport) {
@@ -785,6 +792,25 @@ impl LifecycleController {
 
     pub(crate) fn return_tx_transport(&self, transport: TxTransport) {
         self.put_transport(transport);
+    }
+}
+
+impl Drop for LifecycleController {
+    fn drop(&mut self) {
+        if lock(&self.state).device == DeviceState::Closed {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = crate::device::shutdown_hardware(&self.direct).wait();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let direct = self.direct.stream_handle();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = crate::device::shutdown_hardware(&direct).await;
+            });
+        }
     }
 }
 

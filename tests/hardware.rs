@@ -52,7 +52,7 @@ fn sync_query_configure_and_receive() -> hackrf_nusb::Result<()> {
     let count = rx.read(&mut samples, Some(Duration::from_secs(2))).wait()?;
     assert!(count > 0, "RX timed out after live reconfiguration");
     println!("samples={count}, stats={:?}", rx.stop().wait()?);
-    drop(rx);
+    rx.close().wait()?;
     device.shutdown().wait()?;
     Ok(())
 }
@@ -102,7 +102,8 @@ fn sync_explicit_rx_tx_rx() -> hackrf_nusb::Result<()> {
     );
 
     println!("rx={:?}", rx.stop().wait()?);
-    drop((rx, tx));
+    rx.close().wait()?;
+    tx.close().wait()?;
     device.shutdown().wait()?;
     Ok(())
 }
@@ -147,7 +148,8 @@ fn async_explicit_rx_tx_rx() -> hackrf_nusb::Result<()> {
         );
 
         println!("rx={:?}", rx.stop().await?);
-        drop((rx, tx));
+        rx.close().await?;
+        tx.close().await?;
         device.shutdown().await?;
         Ok(())
     })
@@ -189,7 +191,7 @@ fn async_query_configure_and_receive() -> hackrf_nusb::Result<()> {
         let count = rx.read(&mut samples, None).await?;
         assert!(count > 0, "async RX completed without live reconfiguration");
         println!("samples={count}, stats={:?}", rx.stop().await?);
-        drop(rx);
+        rx.close().await?;
         device.shutdown().await?;
         Ok(())
     })

@@ -24,8 +24,7 @@
 //!     let mut samples = [Complex32::default(); 1024];
 //!     let count = rx.read(&mut samples, Some(Duration::from_secs(1))).wait()?;
 //!     println!("received {count} IQ samples");
-//!     rx.stop().wait()?;
-//!     drop(rx);
+//!     rx.close().wait()?;
 //!     device.shutdown().wait()?;
 //!     Ok(())
 //! }
