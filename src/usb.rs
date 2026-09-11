@@ -11,7 +11,7 @@ use nusb::{Endpoint, MaybeFuture};
 use crate::commands::{TransceiverMode, VendorRequest};
 use crate::constants::CONTROL_TIMEOUT;
 use crate::errors::{Error, Result};
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 use crate::maybe_future::Either;
 use crate::maybe_future::{MaybeFutureExt, ready};
 use crate::streaming::{AsyncBulkInBackend, AsyncStreamingBackend, BulkInCompletion};
@@ -193,7 +193,7 @@ enum ControlConnection {
         _device: nusb::Device,
         interface: nusb::Interface,
     },
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(test)]
     Test(std::sync::Arc<std::sync::Mutex<TestIo>>),
 }
 
@@ -205,7 +205,7 @@ pub(crate) struct NusbBulkIn {
 #[derive(Debug)]
 enum InEndpoint {
     Usb(Endpoint<Bulk, In>),
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(test)]
     Test {
         io: std::sync::Arc<std::sync::Mutex<TestIo>>,
         buffers: std::collections::VecDeque<NusbBuffer>,
@@ -216,7 +216,7 @@ impl InEndpoint {
     fn allocate(&self, len: usize) -> NusbBuffer {
         match self {
             Self::Usb(endpoint) => endpoint.allocate(len),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             Self::Test { .. } => NusbBuffer::new(len),
         }
     }
@@ -224,7 +224,7 @@ impl InEndpoint {
     fn submit(&mut self, buffer: NusbBuffer) {
         match self {
             Self::Usb(endpoint) => endpoint.submit(buffer),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             Self::Test { buffers, .. } => buffers.push_back(buffer),
         }
     }
@@ -232,7 +232,7 @@ impl InEndpoint {
     fn pending(&self) -> usize {
         match self {
             Self::Usb(endpoint) => endpoint.pending(),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             Self::Test { buffers, .. } => buffers.len(),
         }
     }
@@ -241,7 +241,7 @@ impl InEndpoint {
     fn cancel_all(&mut self) {
         match self {
             Self::Usb(endpoint) => endpoint.cancel_all(),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             Self::Test { io, buffers } => {
                 io.lock().unwrap().events.push("rx:retire".into());
                 buffers.clear();
@@ -249,7 +249,7 @@ impl InEndpoint {
         }
     }
 
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(test)]
     fn test_complete(&mut self) -> BulkInCompletion<NusbBuffer> {
         let Self::Test { io, buffers } = self else {
             unreachable!()
@@ -272,11 +272,11 @@ pub(crate) struct NusbBulkOut {
 #[derive(Debug)]
 enum OutEndpoint {
     Usb(Endpoint<Bulk, Out>),
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(test)]
     Test(std::sync::Arc<std::sync::Mutex<TestIo>>),
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct TestIo {
     pub events: Vec<String>,
@@ -286,10 +286,24 @@ pub(crate) struct TestIo {
     pub pause_off: bool,
     pub fail_drain: bool,
     pub pause_drain: bool,
+    off_waker: Option<std::task::Waker>,
+    drain_waker: Option<std::task::Waker>,
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 impl TestIo {
+    pub(crate) fn resume(io: &std::sync::Mutex<Self>) {
+        let (off, drain) = {
+            let mut io = io.lock().unwrap();
+            io.pause_off = false;
+            io.pause_drain = false;
+            (io.off_waker.take(), io.drain_waker.take())
+        };
+        for waker in [off, drain].into_iter().flatten() {
+            waker.wake();
+        }
+    }
+
     pub(crate) fn backends() -> (
         NusbControl,
         NusbBulkOut,
@@ -321,7 +335,7 @@ impl NusbControl {
     fn interface(&self) -> &nusb::Interface {
         match &self.connection {
             ControlConnection::Usb { interface, .. } => interface,
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             ControlConnection::Test(_) => panic!("test control has no USB interface"),
         }
     }
@@ -342,7 +356,7 @@ impl NusbBulkOut {
     pub(crate) fn clear_halt_blocking(&mut self) -> Result<()> {
         match &mut self.endpoint {
             OutEndpoint::Usb(endpoint) => endpoint.clear_halt().wait().map_err(Error::from),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             OutEndpoint::Test(_) => Ok(()),
         }
     }
@@ -350,7 +364,7 @@ impl NusbBulkOut {
     pub(crate) async fn clear_halt_async(&mut self) -> Result<()> {
         match &mut self.endpoint {
             OutEndpoint::Usb(endpoint) => endpoint.clear_halt().await.map_err(Error::from),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             OutEndpoint::Test(_) => Ok(()),
         }
     }
@@ -358,7 +372,7 @@ impl NusbBulkOut {
     pub(crate) fn submit(&mut self, bytes: Vec<u8>) {
         match &mut self.endpoint {
             OutEndpoint::Usb(endpoint) => endpoint.submit(bytes.into()),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             OutEndpoint::Test(io) => {
                 let mut io = io.lock().unwrap();
                 io.events.push(format!("submit:{}", bytes.len()));
@@ -370,7 +384,7 @@ impl NusbBulkOut {
     pub(crate) fn pending(&self) -> usize {
         match &self.endpoint {
             OutEndpoint::Usb(endpoint) => endpoint.pending(),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             OutEndpoint::Test(io) => io.lock().unwrap().pending,
         }
     }
@@ -381,7 +395,7 @@ impl NusbBulkOut {
             OutEndpoint::Usb(endpoint) => endpoint
                 .wait_next_complete(timeout)
                 .map(|completion| completion.status.map_err(Error::from)),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             OutEndpoint::Test(io) => Some(test_complete(io)),
         }
     }
@@ -391,10 +405,11 @@ impl NusbBulkOut {
             OutEndpoint::Usb(endpoint) => {
                 endpoint.next_complete().await.status.map_err(Error::from)
             }
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             OutEndpoint::Test(io) => {
-                std::future::poll_fn(|_| {
+                std::future::poll_fn(|cx| {
                     if io.lock().unwrap().pause_drain {
+                        io.lock().unwrap().drain_waker = Some(cx.waker().clone());
                         Poll::Pending
                     } else {
                         Poll::Ready(test_complete(io))
@@ -406,7 +421,7 @@ impl NusbBulkOut {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 fn test_complete(io: &std::sync::Mutex<TestIo>) -> Result<()> {
     let mut io = io.lock().unwrap();
     io.events.push("complete".into());
@@ -417,14 +432,14 @@ fn test_complete(io: &std::sync::Mutex<TestIo>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 struct TestControlOperation {
     io: std::sync::Arc<std::sync::Mutex<TestIo>>,
     value: u16,
     off: bool,
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 impl TestControlOperation {
     fn execute(&self) -> Result<()> {
         let mut io = self.io.lock().unwrap();
@@ -437,13 +452,14 @@ impl TestControlOperation {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 impl std::future::IntoFuture for TestControlOperation {
     type Output = Result<()>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
     fn into_future(self) -> Self::IntoFuture {
-        Box::pin(std::future::poll_fn(move |_| {
+        Box::pin(std::future::poll_fn(move |cx| {
             if self.off && self.io.lock().unwrap().pause_off {
+                self.io.lock().unwrap().off_waker = Some(cx.waker().clone());
                 Poll::Pending
             } else {
                 Poll::Ready(self.execute())
@@ -452,7 +468,7 @@ impl std::future::IntoFuture for TestControlOperation {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 impl MaybeFuture for TestControlOperation {
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(self) -> Result<()> {
@@ -475,7 +491,7 @@ impl ControlBackend for NusbControl {
         &self,
         request: VendorControlRequest,
     ) -> impl MaybeFuture<Output = Result<()>> + use<> {
-        #[cfg(all(test, not(target_arch = "wasm32")))]
+        #[cfg(test)]
         if let ControlConnection::Test(io) = &self.connection {
             return Either::left(TestControlOperation {
                 io: io.clone(),
@@ -508,11 +524,11 @@ impl ControlBackend for NusbControl {
                 )
                 .map_err(Error::from)
         });
-        #[cfg(all(test, not(target_arch = "wasm32")))]
+        #[cfg(test)]
         {
             Either::right(operation)
         }
-        #[cfg(not(all(test, not(target_arch = "wasm32"))))]
+        #[cfg(not(test))]
         {
             operation
         }
@@ -524,7 +540,7 @@ impl StreamingBackend for NusbControl {
     type BulkIn = NusbBulkIn;
 
     fn bulk_in(&self, endpoint: u8) -> Result<Self::BulkIn> {
-        #[cfg(all(test, not(target_arch = "wasm32")))]
+        #[cfg(test)]
         if let ControlConnection::Test(io) = &self.connection {
             return Ok(NusbBulkIn {
                 endpoint: InEndpoint::Test {
@@ -547,7 +563,7 @@ impl AsyncStreamingBackend for NusbControl {
     type BulkIn = NusbBulkIn;
 
     fn bulk_in(&self, endpoint: u8) -> Result<Self::BulkIn> {
-        #[cfg(all(test, not(target_arch = "wasm32")))]
+        #[cfg(test)]
         if let ControlConnection::Test(io) = &self.connection {
             return Ok(NusbBulkIn {
                 endpoint: InEndpoint::Test {
@@ -573,7 +589,7 @@ impl BulkInBackend for NusbBulkIn {
     fn clear_halt(&mut self) -> Result<()> {
         match &mut self.endpoint {
             InEndpoint::Usb(endpoint) => endpoint.clear_halt().wait().map_err(Error::from),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             InEndpoint::Test { .. } => Ok(()),
         }
     }
@@ -601,7 +617,7 @@ impl BulkInBackend for NusbBulkIn {
                         status: completion.status.map_err(Error::from),
                     })
             }
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             endpoint @ InEndpoint::Test { .. } => Some(endpoint.test_complete()),
         }
     }
@@ -617,7 +633,7 @@ impl AsyncBulkInBackend for NusbBulkIn {
     async fn clear_halt_async(&mut self) -> Result<()> {
         match &mut self.endpoint {
             InEndpoint::Usb(endpoint) => endpoint.clear_halt().await.map_err(Error::from),
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             InEndpoint::Test { .. } => Ok(()),
         }
     }
@@ -645,7 +661,7 @@ impl AsyncBulkInBackend for NusbBulkIn {
                         status: completion.status.map_err(Error::from),
                     })
             }
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(test)]
             endpoint @ InEndpoint::Test { .. } => Poll::Ready(endpoint.test_complete()),
         }
     }

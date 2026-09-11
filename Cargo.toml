@@ -24,5 +24,8 @@ num-complex = "0.4"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
 
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.78"
+
 [dev-dependencies]
 futures-lite = "2"

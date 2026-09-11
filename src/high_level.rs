@@ -1612,34 +1612,41 @@ impl MaybeFuture for TxCloseOperation {
     }
 }
 
+#[cfg(test)]
+fn test_device() -> (Device, std::sync::Arc<std::sync::Mutex<crate::usb::TestIo>>) {
+    let (control, endpoint, io) = crate::usb::TestIo::backends();
+    let direct = HackRf::from_control(control);
+    let radio = LifecycleController::new(direct.stream_handle(), endpoint, 512, false);
+    (
+        Device {
+            inner: DeviceInner {
+                direct,
+                info: DeviceInfo {
+                    board_id: crate::BoardId::HackRfOne,
+                    firmware_version: String::new(),
+                    usb_api_version: 0,
+                    serial: None,
+                },
+            },
+            config: Config::default(),
+            radio,
+        },
+        io,
+    )
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[path = "high_level/webusb_tests.rs"]
+mod webusb_tests;
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lifecycle_tests {
     use super::*;
     use crate::usb::TestIo;
     use futures_lite::future::{block_on, poll_once};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    fn device() -> (Device, Arc<Mutex<TestIo>>) {
-        let (control, endpoint, io) = TestIo::backends();
-        let direct = HackRf::from_control(control);
-        let radio = LifecycleController::new(direct.stream_handle(), endpoint, 512, false);
-        (
-            Device {
-                inner: DeviceInner {
-                    direct,
-                    info: DeviceInfo {
-                        board_id: crate::BoardId::HackRfOne,
-                        firmware_version: String::new(),
-                        usb_api_version: 0,
-                        serial: None,
-                    },
-                },
-                config: Config::default(),
-                radio,
-            },
-            io,
-        )
-    }
+    use super::test_device as device;
 
     fn run<O: MaybeFuture>(operation: O, asynchronous: bool) -> O::Output {
         if asynchronous {
@@ -1860,7 +1867,7 @@ mod lifecycle_tests {
         assert!(block_on(poll_once(operation.as_mut())).is_none());
         drop(operation);
         assert!(matches!(device.rx_stream(), Err(Error::DeviceClosed)));
-        io.lock().unwrap().pause_off = false;
+        TestIo::resume(&io);
         device.shutdown().wait().unwrap();
     }
 

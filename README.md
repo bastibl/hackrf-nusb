@@ -146,6 +146,18 @@ Manually validate a browser handoff on connected hardware by repeating RX
 `start`/`read` → `stop`, TX `start`/`write`/`stop`, then RX `start`/`read` in
 one device session.
 
+Browser lifecycle tests run the WebUSB stream/controller code and actual
+background drop scheduling with fake USB completions; they do not open hardware.
+Install `wasm-bindgen-cli` matching the resolved `wasm-bindgen` version and put
+ChromeDriver on `PATH` (or set `CHROMEDRIVER`), then run:
+
+```sh
+cargo test --target wasm32-unknown-unknown --lib --all-features
+```
+
+CI runs these tests in headless Chrome. Real-device validation is still required
+for browser USB behavior and firmware interactions.
+
 ## Hardware tests
 
 Examples and hardware tests are gated and do not touch USB unless explicitly

@@ -51,3 +51,38 @@ jobs:
 
       - name: Check public API docs
         run: cargo doc --no-deps --all-features
+
+  webusb:
+    name: Browser lifecycle tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+        with:
+          install-chromedriver: true
+      - name: Install matching wasm-bindgen test runner
+        shell: python
+        run: |
+          import json, subprocess
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--format-version", "1"]))
+          version = next(p["version"] for p in metadata["packages"]
+                         if p["name"] == "wasm-bindgen")
+          subprocess.run(["cargo", "install", "wasm-bindgen-cli",
+                          "--version", version, "--locked"], check=True)
+      - name: Configure Chrome
+        shell: python
+        env:
+          CHROME_BINARY: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          import json, os
+          with open("webdriver.json", "w") as output:
+              json.dump({"goog:chromeOptions": {"binary": os.environ["CHROME_BINARY"]}}, output)
+      - name: Exercise WebUSB lifecycle without hardware
+        env:
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver-path }}
+        run: cargo test --target wasm32-unknown-unknown --lib --all-features
