@@ -1297,47 +1297,22 @@ impl TxStream {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn finish_blocking(&mut self, closing: bool) -> Result<TxStreamingStats> {
-        let transition = if closing {
+        let mut transition = if closing {
             self.radio.begin_close(Direction::Tx)?
         } else {
             self.radio.begin_stop_blocking(Direction::Tx)?
         };
         self.state = TxStreamState::Recovery;
-        let (stats, drain_error) =
-            if let Some(transport) = self.transport.as_mut().filter(|t| t.is_reusable()) {
-                match transport.flush_and_drain_blocking() {
-                    Ok(()) => (transport.stats(), None),
-                    Err(error) => {
-                        self.failed = true;
-                        transport.mark_unusable();
-                        (transport.stats(), Some(error))
-                    }
-                }
-            } else {
-                (
-                    self.transport
-                        .as_ref()
-                        .map_or(self.stats, TxTransport::stats),
-                    None,
-                )
-            };
-        if let Some(mut transition) = transition
-            && let Err(error) = transition.finish_blocking()
-        {
-            self.state = TxStreamState::Recovery;
-            return Err(match drain_error {
-                Some(_) => error.at("turn radio off after TX drain failure"),
-                None => error,
-            });
-        }
-        self.stats = stats;
-        if let Some(transport) = self.transport.take()
-            && transport.is_reusable()
-        {
-            self.radio.return_tx_transport(transport);
-        }
-        self.state = TxStreamState::Dormant;
-        drain_error.map_or(Ok(stats), Err)
+        let drain = match self.transport.as_mut().filter(|t| t.is_reusable()) {
+            Some(transport) => transport.flush_and_drain_blocking(),
+            None => Ok(()),
+        };
+        let drain_error = self.record_drain(drain);
+        let off = match transition.as_mut() {
+            Some(transition) => transition.finish_blocking(),
+            None => Ok(()),
+        };
+        self.finish_stop(drain_error, off)
     }
 
     async fn stop_async(&mut self) -> Result<TxStreamingStats> {
@@ -1345,48 +1320,58 @@ impl TxStream {
     }
 
     async fn finish_async(&mut self, closing: bool) -> Result<TxStreamingStats> {
-        let transition = if closing {
+        let mut transition = if closing {
             self.radio.begin_close(Direction::Tx)?
         } else {
             self.radio.begin_stop_async(Direction::Tx).await?
         };
         self.state = TxStreamState::Recovery;
-        let (stats, drain_error) =
-            if let Some(transport) = self.transport.as_mut().filter(|t| t.is_reusable()) {
-                match transport.flush_and_drain_async().await {
-                    Ok(()) => (transport.stats(), None),
-                    Err(error) => {
-                        self.failed = true;
-                        transport.mark_unusable();
-                        (transport.stats(), Some(error))
-                    }
-                }
-            } else {
-                (
-                    self.transport
-                        .as_ref()
-                        .map_or(self.stats, TxTransport::stats),
-                    None,
-                )
-            };
-        if let Some(mut transition) = transition
-            && let Err(error) = transition.finish_async().await
-        {
-            self.state = TxStreamState::Recovery;
-            return Err(match drain_error {
-                Some(_) => error.at("turn radio off after TX drain failure"),
-                None => error,
-            });
+        let drain = match self.transport.as_mut().filter(|t| t.is_reusable()) {
+            Some(transport) => transport.flush_and_drain_async().await,
+            None => Ok(()),
+        };
+        let drain_error = self.record_drain(drain);
+        let off = match transition.as_mut() {
+            Some(transition) => transition.finish_async().await,
+            None => Ok(()),
+        };
+        self.finish_stop(drain_error, off)
+    }
+    // Record failure before awaiting off: cancellation must never let drop
+    // resume draining a transport whose completion already failed.
+    fn record_drain(&mut self, drain: Result<()>) -> Option<Error> {
+        let error = drain.err();
+        if let Some(transport) = self.transport.as_mut() {
+            self.stats = transport.stats();
+            if error.is_some() {
+                self.failed = true;
+                transport.mark_unusable();
+            }
         }
-        self.stats = stats;
+        error
+    }
+
+    fn finish_stop(
+        &mut self,
+        drain_error: Option<Error>,
+        off: Result<()>,
+    ) -> Result<TxStreamingStats> {
+        off.map_err(|error| {
+            if drain_error.is_some() {
+                error.at("turn radio off after TX drain failure")
+            } else {
+                error
+            }
+        })?;
         if let Some(transport) = self.transport.take()
             && transport.is_reusable()
         {
             self.radio.return_tx_transport(transport);
         }
         self.state = TxStreamState::Dormant;
-        drain_error.map_or(Ok(stats), Err)
+        drain_error.map_or(Ok(self.stats), Err)
     }
+
     #[cfg(any(test, target_arch = "wasm32"))]
     fn background_cleanup(&mut self) -> impl Future<Output = ()> + 'static {
         self.cleanup_armed = false;
@@ -1865,7 +1850,13 @@ mod lifecycle_tests {
                 io.fail_drain = true;
                 io.fail_off = true;
             }
-            assert!(run(tx.close(), asynchronous).is_err());
+            assert!(matches!(
+                run(tx.close(), asynchronous),
+                Err(Error::Operation {
+                    operation: "turn radio off after TX drain failure",
+                    ..
+                })
+            ));
             assert_eq!(
                 io.lock().unwrap().events,
                 ["submit:512", "complete", "control:0", "control:0"]
@@ -1883,6 +1874,33 @@ mod lifecycle_tests {
         io.lock().unwrap().fail_drain = true;
         assert!(tx.close().wait().is_err());
         assert!(device.tx_stream().unwrap().start().wait().is_err());
+    }
+
+    #[test]
+    fn cancelled_off_after_drain_failure_never_resumes_the_transport() {
+        let (mut device, io) = device();
+        let mut tx = device.tx_stream().unwrap();
+        block_on(tx.start().into_future()).unwrap();
+        block_on(
+            tx.write(&[Complex32::default(); 1], None, false)
+                .into_future(),
+        )
+        .unwrap();
+        {
+            let mut io = io.lock().unwrap();
+            io.events.clear();
+            io.fail_drain = true;
+            io.pause_off = true;
+        }
+        let mut close = Box::pin(tx.close().into_future());
+        assert!(block_on(poll_once(close.as_mut())).is_none());
+        drop(close);
+        assert_eq!(
+            io.lock().unwrap().events,
+            ["submit:512", "complete", "control:0"]
+        );
+        assert!(device.tx_stream().unwrap().start().wait().is_err());
+        device.shutdown().wait().unwrap();
     }
 
     #[test]
