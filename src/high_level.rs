@@ -758,7 +758,8 @@ impl RxStream {
     ///
     /// Returns [`Error::Busy`] when TX is active or any control transition is
     /// in progress. Calling `start` on an already-running RX stream succeeds
-    /// without changing hardware state.
+    /// without changing hardware state. A different execution style returns
+    /// [`Error::Busy`], including when the stream is already running.
     pub fn start(&mut self) -> impl MaybeFuture<Output = Result<()>> + '_ {
         RxStartOperation { stream: self }
     }
@@ -850,6 +851,9 @@ impl RxStream {
         if self.failed {
             return Err(self.failed_error());
         }
+        if matches!(self.state, RxStreamState::Async(_)) {
+            return Err(Error::Busy);
+        }
         match self.receiver_state() {
             ReceiverState::Running => return Ok(()),
             ReceiverState::CleanupRequired => return Err(Error::Busy),
@@ -871,6 +875,10 @@ impl RxStream {
     async fn start_async(&mut self) -> Result<()> {
         if self.failed {
             return Err(self.failed_error());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(self.state, RxStreamState::Blocking(_)) {
+            return Err(Error::Busy);
         }
         match self.receiver_state() {
             ReceiverState::Running => return Ok(()),
@@ -1131,7 +1139,8 @@ impl TxStream {
     ///
     /// Returns [`Error::Busy`] when RX is active or any control transition is
     /// in progress. Calling `start` on an already-running TX stream succeeds
-    /// without changing hardware state.
+    /// without changing hardware state. A different execution style returns
+    /// [`Error::Busy`], including when the stream is already running.
     pub fn start(&mut self) -> impl MaybeFuture<Output = Result<()>> + '_ {
         TxStartOperation { stream: self }
     }
@@ -1178,6 +1187,12 @@ impl TxStream {
                 "TX stream failed; drop it and create a new TX stream",
             ));
         }
+        if self
+            .style
+            .is_some_and(|selected| selected != ExecutionStyle::Blocking)
+        {
+            return Err(Error::Busy);
+        }
         match self.state {
             TxStreamState::Active => return Ok(()),
             TxStreamState::Recovery => return Err(Error::Busy),
@@ -1196,6 +1211,12 @@ impl TxStream {
             return Err(Error::stream_closed(
                 "TX stream failed; drop it and create a new TX stream",
             ));
+        }
+        if self
+            .style
+            .is_some_and(|selected| selected != ExecutionStyle::Async)
+        {
+            return Err(Error::Busy);
         }
         match self.state {
             TxStreamState::Active => return Ok(()),
@@ -1653,6 +1674,46 @@ mod lifecycle_tests {
             block_on(operation.into_future())
         } else {
             operation.wait()
+        }
+    }
+
+    #[test]
+    fn active_start_checks_execution_style_before_idempotent_success() {
+        for asynchronous in [false, true] {
+            let (mut device, io) = device();
+            let mut rx = device.rx_stream().unwrap();
+            run(rx.start(), asynchronous).unwrap();
+            let before = io.lock().unwrap().events.len();
+            run(rx.start(), asynchronous).unwrap();
+            assert!(matches!(run(rx.start(), !asynchronous), Err(Error::Busy)));
+            assert!(matches!(run(rx.stop(), !asynchronous), Err(Error::Busy)));
+            assert!(matches!(
+                run(rx.read(&mut [Complex32::default(); 1], None), !asynchronous),
+                Err(Error::Busy)
+            ));
+            assert!(matches!(
+                run(device.set_frequency_hz(100_000_000), !asynchronous),
+                Err(Error::Busy)
+            ));
+            assert_eq!(io.lock().unwrap().events.len(), before);
+            run(rx.close(), !asynchronous).unwrap();
+
+            let mut tx = device.tx_stream().unwrap();
+            run(tx.start(), asynchronous).unwrap();
+            let before = io.lock().unwrap().events.len();
+            run(tx.start(), asynchronous).unwrap();
+            assert!(matches!(run(tx.start(), !asynchronous), Err(Error::Busy)));
+            assert!(matches!(run(tx.stop(), !asynchronous), Err(Error::Busy)));
+            assert!(matches!(
+                run(
+                    tx.write(&[Complex32::default(); 1], None, false),
+                    !asynchronous
+                ),
+                Err(Error::Busy)
+            ));
+            assert_eq!(io.lock().unwrap().events.len(), before);
+            run(tx.close(), !asynchronous).unwrap();
+            device.shutdown().wait().unwrap();
         }
     }
 
